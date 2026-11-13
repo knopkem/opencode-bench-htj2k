@@ -1353,23 +1353,25 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         "## Performance",
         "",
-        "| kind | workload | seed MP/s | candidate MP/s | reference MP/s | speedup |",
-        "|---|---|---:|---:|---:|---:|",
+        "| kind | workload | seed MP/s | candidate MP/s | reference MP/s | speedup | cv |",
+        "|---|---|---:|---:|---:|---:|---:|",
     ]
     for item in score["decode"] + score["encode"]:
         if not item.get("valid"):
             lines.append(
-                f"| {item.get('kind', '?')} | {item.get('id', '?')} | - | - | - | invalid |"
+                f"| {item.get('kind', '?')} | {item.get('id', '?')} | - | - | - | invalid | - |"
             )
             continue
         ref = item.get("reference_mp_s")
+        cv = item.get("cv")
+        cv_text = f"{cv * 100:.1f}%" if isinstance(cv, (int, float)) else "—"
         lines.append(
             f"| {item['kind']} | {item['id']} | {item['seed_mp_s']:.1f} | "
             f"{item['candidate_mp_s']:.1f} | "
-            f"{ref:.1f} | x{item['speedup']:.3f} |"
+            f"{ref:.1f} | x{item['speedup']:.3f} | {cv_text} |"
             if ref
             else f"| {item['kind']} | {item['id']} | {item['seed_mp_s']:.1f} | "
-            f"{item['candidate_mp_s']:.1f} | - | x{item['speedup']:.3f} |"
+            f"{item['candidate_mp_s']:.1f} | - | x{item['speedup']:.3f} | {cv_text} |"
         )
     lines += [
         "",

@@ -73,7 +73,7 @@ Performance is seed-normalised:
 decode_speedup = geomean(seed_time / candidate_time)
 encode_speedup = geomean(seed_time / candidate_time)
 
-noise  = 0.05   # measurement noise floor
+noise  = 0.08   # measurement noise floor
 credit = clamp((speedup - 1 - noise) / (target - 1 - noise), 0, 2)
 score  = 100 * (0.5 * credit_decode + 0.5 * credit_encode)
 ```

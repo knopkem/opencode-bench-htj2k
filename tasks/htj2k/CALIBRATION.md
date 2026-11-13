@@ -38,7 +38,7 @@ Geometric mean oracle/seed: decode ≈ 1.39, encode ≈ 0.92.
 The floor prevents a target below 1.25 when the Rust seed happens to be close to
 the C++ implementation on a particular workload. Matching OpenJPH therefore
 scores roughly 100, and a 25% improvement over the seed is full credit per
-dimension. A 5% noise floor is applied before credit, so the untouched seed and
+dimension. An 8% noise floor is applied before credit, so the untouched seed and
 sub-noise changes score exactly 0.
 
 ## Caveats

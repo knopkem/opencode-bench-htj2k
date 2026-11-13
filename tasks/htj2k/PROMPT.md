@@ -81,12 +81,12 @@ end-to-end through the CLI, including file I/O.
 decode_speedup = geometric mean(seed median time / your median time)
 encode_speedup = geometric mean(seed median time / your median time)
 
-noise  = 0.05   # measurement noise floor
+noise  = 0.08   # measurement noise floor
 credit = clamp((speedup - 1 - noise) / (target - 1 - noise), 0, 2)
 score  = 100 * (0.5 * credit_decode + 0.5 * credit_encode)
 ```
 
-- The untouched seed scores **0**; improvements below the 5% noise floor do not
+- The untouched seed scores **0**; improvements below the 8% noise floor do not
   earn points.
 - Matching the frozen target in both dimensions scores **100**.
 - The targets are calibrated from the seed/OpenJPH ratios on the same machine,
