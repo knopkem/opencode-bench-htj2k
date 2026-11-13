@@ -33,28 +33,46 @@ supported CPU. `--no-cpu-set` is for debugging only.
 
 ## Performance looks noisy
 
-The test container is pinned to one CPU and the runner interleaves pristine seed
-and candidate measurements. On a busy host, medians can still move by a few
-percent. Repeat the run before drawing conclusions; do not compare absolute MP/s
-across machines. A threaded local benchmark on an unpinned container is not a
-valid result: check `nproc` first.
+The test container is pinned to one CPU and the runner alternates pristine seed
+and candidate measurements inside each repetition. The score uses the median of
+paired ratios and the held-out final is rescored twice, but on a busy host
+individual workloads can still move by several percent (and a per-process fast
+mode can make min-of-N look inflated). Treat the `±` band in the checkpoint
+prompt and the `cv` column in `report.md` as the noise level, repeat the run
+before drawing conclusions, and do not compare absolute MP/s across machines. A
+threaded local benchmark on an unpinned container is not a valid result: check
+`nproc` first.
 
 ## The run stopped early / rounds
 
-The default plan is 75 / 75 / 45 minutes with a checkpoint after each round. The
-last round is stabilization only. If the model exits early, the next round starts
-from the same session and workdir. The official score is the best eligible
-checkpoint rescored on a held-out final corpus. Look at
+The default plan is 75 / 75 / 45 minutes with a checkpoint after each round. If
+the model ends a non-final round with more than `--nudge-min` minutes left (and
+no `COMPLETION.md`), the harness resumes the same session, up to `--max-nudges`
+times. The final round is graded like the others and may optimize until its
+10-minute freeze. The official score is the best eligible checkpoint rescored
+twice on a held-out final corpus (median per workload). Look at
 `runs/<id>/rounds/round-N/` and `rounds` in `score.json`.
 
 ## The run ended with a provider error
 
 OpenCode can exit 0 even when the provider rejects a request. The harness scans
-the JSON log for `provider.free-limit`, HTTP 429/5xx and usage-limit errors. It
-stops further rounds, keeps the checkpoint for diagnostics, and marks the run
-`agent_error` / ineligible. It will not submit it. `provider_retry_after_s`
-records the provider's cooldown; free-tier limits are often hours long, longer
-than the 4-hour budget. Switch providers or use a paid model.
+the JSON log and separates two cases:
+
+- **Recovered blip.** OpenCode retries a request in place when the engine dies
+  mid-generation ("the next request restarts it"). If the log shows more steps
+  after the error, the round was not lost: the run continues and stays eligible.
+  `provider_error_count` / `provider_recovered` in `score.json` record it.
+- **Unrecovered failure.** A quota/auth/rate-limit error is terminal: the
+  harness stops further rounds, keeps the checkpoint for diagnostics, marks the
+  run `agent_error` / ineligible and will not submit it. `provider_retry_after_s`
+  records the provider's cooldown; free-tier limits are often hours long, longer
+  than the 4-hour budget. Switch providers or use a paid model.
+
+Other unrecovered engine errors (5xx, `provider.internal`) are retried by
+resuming the same session and workdir, up to `--provider-retries` (default 2)
+attempts with backoff, while the round has budget left. Tune with
+`--provider-retries 0` to disable, or `--provider-retry-delay` for the initial
+backoff. Retry logs are written as `agent-round-N-retryK.log`.
 
 ## The leaderboard shows a single run
 

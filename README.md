@@ -26,6 +26,7 @@ containers.
 ./bench.py run --model provider/model          # 75/75/45 checkpointed rounds
 ./bench.py run --model provider/model --variant high
 ./bench.py run --model provider/model --round-plan 90,90,30
+./bench.py run --model provider/model --max-nudges 2 --nudge-min 10 --final-reps 2
 ./bench.py status
 ./bench.py report
 ./bench.py leaderboard           # serve + open the local page
@@ -54,8 +55,11 @@ candidate cannot read.
 
 The agent run is split into three rounds (75 / 75 / 45 minutes). After each round
 the harness builds the workdir and reports gate status and speedups on a
-validation corpus. The last round is stabilization only. The official score is
-the best eligible checkpoint, rescored on a held-out final corpus.
+validation corpus. The final round is graded like the others and may keep
+optimizing until a 10-minute freeze before its deadline. A non-final round that
+ends early with time left is resumed automatically. The official score is the
+best eligible checkpoint, rescored twice on a held-out final corpus and combined
+as the median per workload.
 
 ## Grading
 
@@ -70,17 +74,24 @@ Correctness is a gate:
 Performance is seed-normalised:
 
 ```text
-decode_speedup = geomean(seed_time / candidate_time)
-encode_speedup = geomean(seed_time / candidate_time)
+per workload:
+  speedup = median over repetitions of (seed_time / candidate_time)
+decode_speedup = geomean(workload speedups)
+encode_speedup = geomean(workload speedups)
 
 noise  = 0.08   # measurement noise floor
 credit = clamp((speedup - 1 - noise) / (target - 1 - noise), 0, 2)
 score  = 100 * (0.5 * credit_decode + 0.5 * credit_encode)
 ```
 
-The untouched seed scores `0`. Matching the frozen target in both dimensions
-scores `100`; targets are derived from the seed/OpenJPH ratios on the reference
-machine with a 1.25x floor. Correctness failure means ineligible and `0`.
+Seed and candidate alternate inside every repetition, so the paired ratio
+cancels the per-process fast/slow modes seen on shared hosts. Min-of-N is
+reported as a diagnostic but is not scored: one binary can hit a transient fast
+mode that the other misses. The held-out final grading is repeated twice and
+combined as the median per workload. The untouched seed scores `0`. Matching the
+frozen target in both dimensions scores `100`; targets are derived from the
+seed/OpenJPH ratios on the reference machine with a 1.25x floor. Correctness
+failure means ineligible and `0`.
 
 The frozen catalog is `tasks/htj2k/tests/manifest.json`: suite `htj2k-v1`,
 per-run validation and held-out final seeds, ten encode+decode cases, five
@@ -100,8 +111,9 @@ seed; the official score uses the final seed.
 | Candidate memory cap | 2 GiB |
 | File deadline | 120 s |
 | Perf suite deadline | 15 min |
-| Perf repetitions | 7 |
+| Perf repetitions | 9 |
 | Perf CPU budget | 1 CPU |
+| Final grading repeats | 2 |
 | Encode size slack | 2% + 1 KiB |
 
 ## Test families
@@ -152,10 +164,18 @@ and is low-confidence. Three runs with different seeds are recommended for a
 strong claim. Community submissions are self-reported unless a maintainer adds
 `verified`.
 
-Provider quota/rate-limit errors (`provider.free-limit`, HTTP 429/5xx) are
-detected in the agent log. The harness stops immediately, keeps the checkpoint
-for diagnostics, marks the run `agent_error` and ineligible, and refuses to
-submit it. Such a run is not a model result.
+Provider quota, auth and rate-limit errors (`provider.free-limit`,
+`provider.rate-limit`, HTTP 401/403/429) are detected in the agent log. The
+harness stops immediately, keeps the checkpoint for diagnostics, marks the run
+`agent_error` and ineligible, and refuses to submit it. Such a run is not a
+model result.
+
+Transient engine failures are different. OpenCode retries a request in place
+when the backend dies mid-generation, so a `provider.internal` / 5xx error
+followed by more steps in the same log is a blip: the run continues, stays
+eligible, and the report records it. An unrecovered transient failure resumes
+the same session and workdir for up to `--provider-retries` extra attempts
+(default 2) with backoff, but only while the round budget lasts.
 
 ## License and attribution
 

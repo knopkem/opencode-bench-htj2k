@@ -197,6 +197,24 @@
         "null"
       ]
     },
+    "provider_errors": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "provider_error_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "provider_recovered": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "provider_retries": {
+      "type": "integer",
+      "minimum": 0
+    },
     "provider_retry_after_s": {
       "type": [
         "number",

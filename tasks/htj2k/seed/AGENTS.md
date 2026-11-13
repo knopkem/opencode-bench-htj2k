@@ -5,6 +5,9 @@ run workdir and gives the agent four hours across checkpointed rounds. The hidde
 suite is not here. The grader exposes exactly one pinned CPU; thread-based
 parallelism will not help.
 
+`/work/ROUND-TIME.md` holds the live round clock; check `date -u` against its
+deadline. The session is non-interactive, so the `question` tool is disabled.
+
 ## Layout
 
 ```text

@@ -33,6 +33,11 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
   builds the workdir and runs the full hidden suite on a validation seed. The
   official score is the best eligible checkpoint rescored on a held-out final
   seed. Checkpoints are implemented in `run_one`, not as separate tasks.
+- A non-final round that ends with more than `--nudge-min` minutes left (and no
+  `COMPLETION.md`) is resumed in the same session, up to `--max-nudges` times.
+  The final round is allowed to optimize until its freeze point.
+- Every round writes `/work/ROUND-TIME.md` and the agent config disables the
+  interactive `question` tool; benchmark sessions have no user to answer it.
 - Correctness is bit-exact for lossless decode and encode. Lossy, RGB and
   multi-component modes are out of scope for `htj2k-v1`.
 - The graded encode profile is `4x1024` code-blocks. Decode coverage includes
@@ -40,9 +45,17 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
 - `Cargo.lock` package allowlist is fixed in `bench.py`. Adding a dependency or
   a `build.rs` is a gate failure by design.
 - The score is seed-normalised. The pristine seed scores 0; targets are frozen
-  in `manifest.json` and calibrated so the in-run OpenJPH oracle is about 100.
-  Changing targets, corpus or suite version requires recalibration and a suite
-  version bump.
+  in `manifest.json`. The decode target is the measured seed/OpenJPH ratio on the
+  reference machine; the encode target is the 1.25x floor because the seed
+  encoder is already faster than the in-run oracle (about x0.87). Consequently
+  the in-run OpenJPH oracle scores roughly **64**, not 100: it gets decode credit
+  but no encode credit. Changing targets, corpus or suite version requires
+  recalibration and a suite version bump.
+- Throughput is the **median of paired seed/candidate ratios** over 9 timed
+  repetitions with randomized order. Per-process host-state changes are not
+  shared, so min-of-N can put a faster candidate below the seed; it is kept as
+  a diagnostic only. The held-out final grading is repeated twice and combined
+  as the median per workload.
 
 ## Validation gates
 
@@ -62,6 +75,16 @@ changes no code):
   --agent-cmd 'echo noop > /work/COMPLETION.md' \
   --round-plan 1,1,1
 ./bench.py rescore <run_id>
+```
+
+The no-op check also exercises the per-round clock, the staged agent config
+(`question` denied) and the two-repeat final grading. To exercise the early-exit
+nudge, use a non-final round and let the mock agent exit without COMPLETION:
+
+```bash
+./bench.py run --model mock/noop --no-preflight --max-nudges 1 --nudge-min 0.1 \
+  --round-plan 1,1 --agent-cmd 'echo noop >> /work/MOCK.md'
+ls runs/<run_id>/agent-round-1-continue1.log
 ```
 
 `./bench.py check` probes both images with the cpuset and fails if `nproc` or
@@ -98,6 +121,9 @@ Requirements:
 - Network is labelled `open` for cloud models. Do not mix open-network and
   offline results in the same ranking.
 - Provider quota/rate-limit errors are not model failures. Stop at the first
-  `provider.*`/429/5xx error, keep the checkpoint, mark the run `agent_error`
-  and ineligible, and never submit it. Do not spend later rounds on a dead
-  provider.
+  terminal (`401`/`403`/`429`, quota, auth) error, keep the checkpoint, mark the
+  run `agent_error` and ineligible, and never submit it. Do not spend later
+  rounds on a dead provider. A transient engine failure that the same log shows
+  the engine recovered from is a blip, not a provider failure: the run stays
+  eligible. Unrecovered transient failures resume the session for a bounded
+  number of attempts (`--provider-retries`, default 2) inside the round budget.

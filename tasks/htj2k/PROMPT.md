@@ -15,7 +15,14 @@ oracle. You may restructure the Rust implementation freely.
 
 - You have up to **4 hours** of wall time (hard cap) and a **1-hour** no-output
   timeout. The run is split into **75 / 75 / 45 minute rounds** with a checkpoint
-  after each. The last round is for stabilization only.
+  after each.
+- The live clock is `/work/ROUND-TIME.md`; check `date -u` against its deadline.
+  This is a non-interactive benchmark: the `question` tool is disabled. If your
+  turn ends with time left, the harness resumes the session and asks you to keep
+  going.
+- The final round is graded like every other checkpoint: keep optimizing while
+  time remains, but **freeze 10 minutes before the deadline** to remove
+  instrumentation, build, test and write `COMPLETION.md`.
 - The grader exposes **exactly one CPU**. `available_parallelism()` is 1.
   Thread-based parallelism will not help; do not build a thread pool.
 - After each round the harness builds your tree and tells you the gate status
@@ -78,14 +85,18 @@ per-run seed and is larger than the public fixtures. Throughput is measured
 end-to-end through the CLI, including file I/O.
 
 ```
-decode_speedup = geometric mean(seed median time / your median time)
-encode_speedup = geometric mean(seed median time / your median time)
+decode_speedup = geometric mean over workloads of
+                 median over repetitions of (seed_time / your_time)
+encode_speedup = same for encode
 
 noise  = 0.08   # measurement noise floor
 credit = clamp((speedup - 1 - noise) / (target - 1 - noise), 0, 2)
 score  = 100 * (0.5 * credit_decode + 0.5 * credit_encode)
 ```
 
+- The seed and your binary alternate inside each repetition, so the ratio
+  cancels per-process fast/slow modes on the host. Re-measure anything inside
+  the checkpoint's reported `±` band before believing it.
 - The untouched seed scores **0**; improvements below the 8% noise floor do not
   earn points.
 - Matching the frozen target in both dimensions scores **100**.
@@ -117,10 +128,24 @@ cp -a . /tmp/htj2k-pristine
 
 ## Suggested optimisation surface
 
-- Entropy coder: HT block cleanup/refinement passes, VLC tables, bit-buffer
-  handling, sign/magnitude conversion.
-- Wavelet transform: reversible 5-3 horizontal/vertical lifting, cache-friendly
-  traversal, SIMD where it pays off.
+Measured on the graded corpus, the block coder dominates: roughly three quarters
+of decode time and most of encode time. The DWT is real but secondary. The
+seed's `4x1024` decode path is already close to OpenJPH; the largest decode gap
+is small-block (`64x64`) decoding. On encode the seed is already faster than
+OpenJPH, so the target needs a real algorithmic win, not a recompile.
+
+The highest-value work in this codebase has been:
+
+- **Block decoder**: batched magnitude/sign bit extraction and refinement in the
+  HT cleanup pass (the single largest decode cost).
+- **Block encoder**: a zero-quad-pair fast path that skips magnitude/UVLC
+  book-keeping for entirely insignificant quad pairs, which dominate the
+  high-frequency bands.
+- **Wavelet and buffers**: remove per-line allocations, full-image copies and
+  redundant zero-fill; small-block decode benefits most.
+
+Other surfaces:
+
 - Code-block scheduling and allocation: avoid per-row `Vec` churn, reuse
   buffers across blocks, reduce copies in the CLI wrapper.
 - Quantisation/level-shift and pixel packing/unpacking.

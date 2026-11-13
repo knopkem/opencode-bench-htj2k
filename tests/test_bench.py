@@ -252,6 +252,138 @@ class HarnessTests(unittest.TestCase):
             self.assertEqual(error["type"], "provider.free-limit")
             self.assertEqual(error["status"], 429)
 
+    def test_recovered_provider_error_is_not_fatal(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = bench.Path(directory) / "agent.log"
+            path.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "step_finish", "part": {"reason": "tool-calls"}}),
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "provider.internal",
+                                    "status": 200,
+                                    "message": "the GPU reported a fatal error and the engine ended",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "step_start"}),
+                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
+                    ]
+                )
+                + "\n"
+            )
+            analysis = bench.analyze_provider_errors(path)
+            self.assertTrue(analysis["recovered"])
+            self.assertFalse(analysis["terminal"])
+            self.assertFalse(analysis["retryable"])
+            self.assertIsNone(analysis["last_error"])
+            self.assertIsNone(bench.parse_provider_error(path))
+
+    def test_unrecovered_transient_error_is_retryable(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = bench.Path(directory) / "agent.log"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "provider.internal",
+                            "status": 502,
+                            "message": "bad gateway",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            analysis = bench.analyze_provider_errors(path)
+            self.assertFalse(analysis["recovered"])
+            self.assertFalse(analysis["terminal"])
+            self.assertTrue(analysis["retryable"])
+            self.assertEqual(analysis["last_error"]["status"], 502)
+
+    def test_provider_retry_delay(self) -> None:
+        args = argparse.Namespace(provider_retry_delay=30.0)
+        agent = {"provider_error": {"retry_after_ms": 90000}}
+        self.assertEqual(bench.provider_retry_delay(agent, [{}], args), 90.0)
+        self.assertEqual(bench.provider_retry_delay(agent, [{}, {}], args), 180.0)
+        self.assertLessEqual(
+            bench.provider_retry_delay(agent, [{} for _ in range(10)], args), 900.0
+        )
+        agent = {"provider_error": {}}
+        self.assertEqual(bench.provider_retry_delay(agent, [{}], args), 30.0)
+
+    def test_refresh_provider_status_reclassifies_recovered(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = bench.Path(directory)
+            (run / "agent-round-1.log").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "error",
+                                "error": {
+                                    "type": "provider.internal",
+                                    "status": 200,
+                                    "message": "the GPU reported a fatal error",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "step_start"}),
+                        json.dumps({"type": "step_finish", "part": {"reason": "stop"}}),
+                    ]
+                )
+                + "\n"
+            )
+            meta = {
+                "rounds": [{"round": 1, "provider_error": True}],
+                "provider_errors": [],
+                "provider_error_count": 1,
+                "agent_error": {"type": "provider.internal"},
+                "outcome": "provider-error",
+                "watchdog": "exit",
+                "completion": False,
+                "files_changed": 2,
+                "agent_ok": False,
+            }
+            self.assertTrue(bench.refresh_provider_status(meta, run))
+            self.assertIsNone(meta["agent_error"])
+            self.assertTrue(meta["agent_ok"])
+            self.assertEqual(meta["outcome"], "agent-exit-with-changes")
+            self.assertFalse(meta["rounds"][0]["provider_error"])
+            self.assertEqual(meta["rounds"][0]["provider_recovered"], 1)
+            self.assertEqual(meta["provider_recovered"], 1)
+            self.assertFalse(bench.refresh_provider_status(meta, run))
+
+    def test_refresh_provider_status_keeps_terminal_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run = bench.Path(directory)
+            (run / "agent-round-1.log").write_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "provider.free-limit",
+                            "status": 429,
+                            "message": "Free usage limit reached",
+                        },
+                    }
+                )
+                + "\n"
+            )
+            meta = {
+                "rounds": [{"round": 1, "provider_error": True}],
+                "agent_error": {"type": "provider.free-limit"},
+                "outcome": "provider-error",
+                "agent_ok": False,
+            }
+            bench.refresh_provider_status(meta, run)
+            self.assertEqual(meta["agent_error"]["type"], "provider.free-limit")
+            self.assertFalse(meta["agent_ok"])
+            self.assertEqual(meta["outcome"], "provider-error")
+
     def test_aggregate_skips_agent_error(self) -> None:
         row = {
             "run_id": "bad",
@@ -314,6 +446,120 @@ class LeaderboardTests(unittest.TestCase):
         self.assertEqual(entries[0]["run_id"], "b")
         self.assertAlmostEqual(entries[0]["_score"], 15.0)
         self.assertAlmostEqual(entries[1]["_score"], 10.0)
+
+
+class MeasurementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.manifest = bench.load_manifest()
+
+    def test_combine_repeats_uses_median_speedup(self) -> None:
+        first = fake_results(self.manifest, decode_speedup=1.20, encode_speedup=1.00)
+        second = fake_results(self.manifest, decode_speedup=1.40, encode_speedup=1.20)
+        combined = bench.combine_repeat_results(
+            [
+                {"result": first, "test_ok": True},
+                {"result": second, "test_ok": True},
+            ],
+            self.manifest,
+        )
+        self.assertTrue(combined["result_valid"])
+        self.assertTrue(combined["test_ok"])
+        perf = combined["result"]["perf"]
+        self.assertEqual(perf["repeats"], 2)
+        for item in perf["decode"]:
+            self.assertAlmostEqual(item["speedup"], 1.30)
+        for item in perf["encode"]:
+            self.assertAlmostEqual(item["speedup"], 1.10)
+
+    def test_combine_repeats_requires_every_gate(self) -> None:
+        good = fake_results(self.manifest, 1.2)
+        bad = fake_results(
+            self.manifest, 1.2, fail_case="p0.decode-lossless:gray-12-512-d5-4x1024-lrcp"
+        )
+        combined = bench.combine_repeat_results(
+            [{"result": good, "test_ok": True}, {"result": bad, "test_ok": True}],
+            self.manifest,
+        )
+        self.assertFalse(combined["result"]["all_gates"])
+        self.assertFalse(combined["test_ok"])
+
+    def test_combine_repeats_requires_every_perf_item(self) -> None:
+        good = fake_results(self.manifest, 1.2)
+        broken = fake_results(self.manifest, 1.2)
+        broken["perf"]["decode"][0]["valid"] = False
+        combined = bench.combine_repeat_results(
+            [{"result": good, "test_ok": True}, {"result": broken, "test_ok": True}],
+            self.manifest,
+        )
+        self.assertFalse(combined["result"]["perf_valid"])
+        self.assertFalse(combined["result"]["perf"]["decode_valid"])
+
+    def test_combine_repeats_reports_missing_results(self) -> None:
+        combined = bench.combine_repeat_results(
+            [{"result": None, "test_ok": False, "error": "boom"}, {"result": None, "test_ok": False}],
+            self.manifest,
+        )
+        self.assertFalse(combined["result_valid"])
+        self.assertIn("boom", combined["error"])
+
+    def test_strip_jsonc(self) -> None:
+        text = """
+        {
+          // line comment
+          "a": 1, /* block comment */
+          "b": [1, 2,],
+          "url": "http://example.com//x",
+        }
+        """
+        data = json.loads(bench.strip_jsonc(text))
+        self.assertEqual(data["a"], 1)
+        self.assertEqual(data["b"], [1, 2])
+        self.assertEqual(data["url"], "http://example.com//x")
+
+    def test_prepare_agent_config_disables_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config" / "opencode"
+            config.mkdir(parents=True)
+            (config / "opencode.jsonc").write_text(
+                '{\n  // keep providers\n  "model": "p/m",\n  "tools": {"skill": false}\n}\n'
+            )
+            run_dir = root / "run"
+            staged = bench.prepare_agent_config(config, run_dir)
+            self.assertTrue((staged / "opencode.json").exists())
+            self.assertFalse((staged / "opencode.jsonc").exists())
+            data = json.loads((staged / "opencode.json").read_text())
+            self.assertFalse(data["tools"]["question"])
+            self.assertFalse(data["tools"]["skill"])
+            # the user's config is untouched
+            self.assertTrue((config / "opencode.jsonc").exists())
+            self.assertIn("// keep providers", (config / "opencode.jsonc").read_text())
+
+    def test_prepare_agent_config_from_explicit_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "custom" / "opencode.json"
+            source.parent.mkdir(parents=True)
+            source.write_text('{"model": "p/m", "tools": {}}')
+            run_dir = root / "run"
+            resolved = bench.resolve_config_dir(str(source), run_dir)
+            self.assertTrue(resolved.exists())
+            staged = bench.prepare_agent_config(resolved, run_dir)
+            self.assertTrue(resolved.exists())
+            self.assertTrue((staged / "opencode.json").exists())
+            data = json.loads((staged / "opencode.json").read_text())
+            self.assertFalse(data["tools"]["question"])
+
+    def test_round_clock_and_continue_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workdir = Path(directory)
+            clock = bench.write_round_time(workdir, 2, 600.0, started_at=1_700_000_000.0)
+            text = clock.read_text()
+            self.assertIn("deadline", text)
+            self.assertIn("2023-11-14T", text)
+            prompt = bench.write_continue_prompt(workdir, 2, 1, 420.0)
+            self.assertTrue(prompt.exists())
+            self.assertIn("7 minutes", prompt.read_text())
 
 
 if __name__ == "__main__":

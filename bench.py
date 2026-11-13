@@ -175,11 +175,15 @@ CSV_FIELDS = [
     "network_policy",
     "rounds",
     "round_plan",
+    "final_reps",
     "best_round",
     "validation_seed",
     "final_seed",
     "confidence",
     "agent_error",
+    "provider_error_count",
+    "provider_recovered",
+    "provider_retries",
     "provider_retry_after_s",
     "budget_wall_cap_s",
     "budget_idle_timeout_s",
@@ -437,6 +441,87 @@ def config_env_names(config_dir: Path) -> set[str]:
     return names
 
 
+def strip_jsonc(text: str) -> str:
+    """Turn JSONC into JSON: drop comments and trailing commas."""
+    out: list[str] = []
+    index = 0
+    length = len(text)
+    in_string = False
+    escaped = False
+    while index < length:
+        char = text[index]
+        if in_string:
+            out.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            index += 1
+            continue
+        if char == '"':
+            in_string = True
+            out.append(char)
+            index += 1
+        elif char == "/" and index + 1 < length and text[index + 1] == "/":
+            index += 2
+            while index < length and text[index] not in "\r\n":
+                index += 1
+        elif char == "/" and index + 1 < length and text[index + 1] == "*":
+            index += 2
+            while index + 1 < length and not (text[index] == "*" and text[index + 1] == "/"):
+                index += 1
+            index += 2
+        else:
+            out.append(char)
+            index += 1
+    return re.sub(r",(\s*[}\]])", r"\1", "".join(out))
+
+
+def prepare_agent_config(config_dir: Path, run_dir: Path) -> Path:
+    """Stage a per-run config copy with interactive tools disabled.
+
+    Benchmark sessions are non-interactive: `question` only ever wastes a step.
+    The user's config is copied (never modified), converted to plain JSON if it
+    was JSONC, and given `tools.question = false`.
+    """
+    target = run_dir / "agent-config" / "opencode"
+    try:
+        if target.exists():
+            shutil.rmtree(target)
+        if config_dir.is_file():
+            target.mkdir(parents=True)
+            data = json.loads(strip_jsonc(config_dir.read_text(encoding="utf-8")))
+            data.setdefault("tools", {})["question"] = False
+            (target / "opencode.json").write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+            return target
+        shutil.copytree(
+            config_dir,
+            target,
+            ignore=shutil.ignore_patterns("*.bak-*", "__pycache__", "*.pyc"),
+        )
+        candidates = [target / "opencode.jsonc", target / "opencode.json"]
+        for path in candidates:
+            if not path.exists():
+                continue
+            data = json.loads(strip_jsonc(path.read_text(encoding="utf-8")))
+            data.setdefault("tools", {})["question"] = False
+            for other in candidates:
+                if other.exists():
+                    other.unlink()
+            (target / "opencode.json").write_text(
+                json.dumps(data, indent=2) + "\n", encoding="utf-8"
+            )
+            break
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        print(f"  warning: could not stage the agent config override ({exc})")
+        return config_dir
+    return target
+
+
 def load_model_entry(model: str) -> dict | None:
     try:
         proc = subprocess.run(
@@ -569,17 +654,59 @@ def agent_command(
     return " ".join(parts)
 
 
-def parse_provider_error(log_path: Path) -> dict | None:
-    """Find a provider/API failure in an OpenCode JSON log.
+PROVIDER_TERMINAL_KINDS = {
+    "provider.auth",
+    "provider.permission",
+    "provider.quota",
+    "provider.free-limit",
+    "provider.rate-limit",
+    "rate_limit",
+    "free_limit",
+}
+PROVIDER_TERMINAL_STATUSES = {401, 403, 429}
+PROVIDER_FAILURE_STATUSES = {401, 403, 429, 500, 502, 503, 504}
+PROVIDER_PROGRESS_EVENTS = {"step_start", "step_finish", "text", "tool_use"}
+PROVIDER_MAX_EVENTS = 20
 
-    OpenCode can exit 0 even when the provider rejects a request. The error
-    event is the reliable signal; a run aborted by quota/rate limit is not a
-    model result.
+
+def _is_provider_failure(kind: str, status: object, message: str) -> bool:
+    return (
+        kind.startswith("provider.")
+        or kind in {"rate_limit", "free_limit", "provider"}
+        or status in PROVIDER_FAILURE_STATUSES
+        or "usage limit" in message.lower()
+    )
+
+
+def _is_terminal_provider_failure(entry: dict) -> bool:
+    """A failure the engine cannot wait out: auth, quota or rate limit."""
+    kind = str(entry.get("type") or "").lower()
+    status = entry.get("status")
+    message = str(entry.get("message") or "").lower()
+    if status in PROVIDER_TERMINAL_STATUSES:
+        return True
+    if kind in PROVIDER_TERMINAL_KINDS:
+        return True
+    return any(
+        marker in message
+        for marker in ("usage limit", "quota", "insufficient", "unauthorized", "invalid api key")
+    )
+
+
+def parse_provider_events(log_path: Path) -> list[dict]:
+    """Return provider failures in an OpenCode JSON log, in order.
+
+    Each entry records whether the session kept making progress after the
+    failure. OpenCode retries a request in place when the engine dies
+    mid-generation ("the next request restarts it"), so a transient failure
+    followed by more steps is a recovered blip, not a provider outage.
     """
     if not log_path.exists():
-        return None
-    found: dict | None = None
-    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        return []
+    failures: list[tuple[int, dict]] = []
+    progress: set[int] = set()
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    for index, line in enumerate(text.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
             continue
@@ -587,27 +714,73 @@ def parse_provider_error(log_path: Path) -> dict | None:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") != "error":
-            continue
-        error = event.get("error") or {}
-        if not isinstance(error, dict):
-            error = {"message": str(error)}
-        kind = str(error.get("type") or "")
-        status = error.get("status")
-        message = str(error.get("message") or "")
-        if (
-            kind.startswith("provider.")
-            or kind in {"rate_limit", "free_limit", "provider"}
-            or status in {429, 500, 502, 503, 504}
-            or "usage limit" in message.lower()
-        ):
-            found = {
-                "type": kind or "provider",
-                "status": status,
-                "message": message[:400],
-                "retry_after_ms": event.get("retryAfterMs"),
-            }
-    return found
+        kind = event.get("type")
+        if kind == "error":
+            error = event.get("error") or {}
+            if not isinstance(error, dict):
+                error = {"message": str(error)}
+            error_type = str(error.get("type") or "")
+            status = error.get("status")
+            message = str(error.get("message") or "")
+            if _is_provider_failure(error_type, status, message):
+                failures.append(
+                    (
+                        index,
+                        {
+                            "type": error_type or "provider",
+                            "status": status,
+                            "message": message[:400],
+                            "retry_after_ms": event.get("retryAfterMs"),
+                        },
+                    )
+                )
+        elif kind in PROVIDER_PROGRESS_EVENTS:
+            progress.add(index)
+    events: list[dict] = []
+    for index, entry in failures:
+        entry["recovered"] = any(position > index for position in progress)
+        events.append(entry)
+    return events[-PROVIDER_MAX_EVENTS:]
+
+
+def analyze_provider_errors(log_path: Path) -> dict:
+    """Classify provider failures: recovered blip, retryable, or terminal.
+
+    A run is only a provider error when a failure is left unrecovered. Quota
+    and auth failures are terminal; other engine failures may be retried by
+    resuming the session.
+    """
+    events = parse_provider_events(log_path)
+    unrecovered = [event for event in events if not event.get("recovered")]
+    terminal = any(_is_terminal_provider_failure(event) for event in unrecovered)
+    return {
+        "events": events,
+        "count": len(events),
+        "recovered": bool(events) and not unrecovered,
+        "terminal": terminal,
+        "retryable": bool(unrecovered) and not terminal,
+        "last_error": unrecovered[-1] if unrecovered else None,
+    }
+
+
+def parse_provider_error(log_path: Path) -> dict | None:
+    """Return a provider failure that actually ended the run, or None.
+
+    A failure the engine recovered from (more steps in the same log) is not an
+    agent error: the model finished the work it was doing.
+    """
+    return analyze_provider_errors(log_path)["last_error"]
+
+
+def provider_retry_delay(agent: dict, attempts: list[dict], args: argparse.Namespace) -> float:
+    """Backoff before resuming a round after a transient provider failure."""
+    base = max(0.0, float(getattr(args, "provider_retry_delay", 30.0)))
+    error = agent.get("provider_error") or {}
+    retry_after = error.get("retry_after_ms")
+    if isinstance(retry_after, (int, float)) and retry_after > 0:
+        base = max(base, float(retry_after) / 1000.0)
+    exponent = max(0, len(attempts) - 1)
+    return min(base * (2**exponent), 15 * 60.0)
 
 
 def start_agent(
@@ -625,9 +798,11 @@ def start_agent(
     continue_session: bool = False,
     timeout_s: float | None = None,
     idle_timeout_s: float | None = None,
+    log_suffix: str = "",
+    watch_completion: bool = True,
 ) -> dict:
     name = f"opencode-bench-htj2k-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
-    log_path = run_dir / f"agent-round-{round_number}.log"
+    log_path = run_dir / f"agent-round-{round_number}{log_suffix}.log"
     command = [
         args.engine,
         "run",
@@ -676,6 +851,11 @@ def start_agent(
             "agent_ok": True,
             "agent_exit_code": None,
             "self_test_runs": 0,
+            "provider_error": None,
+            "provider_errors": [],
+            "provider_recovered": False,
+            "provider_terminal": False,
+            "provider_retryable": False,
         }
 
     start = time.time()
@@ -706,7 +886,7 @@ def start_agent(
             if size != last_size:
                 last_size = size
                 last_change = now
-            if completion_path.exists() and completion_seen_at is None:
+            if watch_completion and completion_path.exists() and completion_seen_at is None:
                 completion_seen_at = now
                 print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
             if completion_seen_at is not None and now - completion_seen_at > 60:
@@ -735,17 +915,26 @@ def start_agent(
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     self_tests = len(SELF_TEST_RE.findall(log_text))
     session_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', log_text)
-    provider_error = parse_provider_error(log_path)
+    provider = analyze_provider_errors(log_path)
+    provider_error = provider["last_error"]
+    # OpenCode exits non-zero when the provider errored, even if it retried in
+    # place and finished the step. Progress after the failure is the signal
+    # that matters, not the process exit code.
+    agent_ok = provider_error is None and (proc.returncode == 0 or provider["recovered"])
     return {
         "wall_s": wall_s,
         "watchdog": watchdog,
         "completion": (workdir / "COMPLETION.md").exists(),
-        "agent_ok": proc.returncode == 0 and provider_error is None,
+        "agent_ok": agent_ok,
         "agent_exit_code": proc.returncode,
         "self_test_runs": self_tests,
         "session_id": session_match.group(1) if session_match else None,
         "log_path": str(log_path),
         "provider_error": provider_error,
+        "provider_errors": provider["events"],
+        "provider_recovered": provider["recovered"],
+        "provider_terminal": provider["terminal"],
+        "provider_retryable": provider["retryable"],
     }
 
 
@@ -800,7 +989,7 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
         "metrics_source": "log",
         "metrics_version": 1,
     }
-    if not log_path.exists():
+    if not log_path.is_file():
         return metrics
     step_starts: dict[str, int] = {}
     steps = 0
@@ -867,6 +1056,57 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
     return metrics
 
 
+def combine_attempt_metrics(attempts: list[dict]) -> dict:
+    """Merge the usage metrics of every attempt of one round."""
+    total_wall = sum(float(item.get("wall_s") or 0.0) for item in attempts)
+    merged: dict | None = None
+    request_max = 0
+    means: list[float] = []
+    for item in attempts:
+        usage = read_agent_usage(
+            Path(item.get("log_path") or ""), float(item.get("wall_s") or 0.0)
+        )
+        request_max = max(request_max, int(usage.get("max_request_tokens") or 0))
+        if usage.get("mean_request_tokens") is not None:
+            means.append(float(usage["mean_request_tokens"]))
+        if merged is None:
+            merged = dict(usage)
+            continue
+        for key, value in usage.items():
+            if key in {
+                "max_request_tokens",
+                "mean_request_tokens",
+                "gen_tokens_per_s",
+                "metrics_source",
+                "metrics_version",
+            }:
+                continue
+            if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
+                merged[key] += value
+    if merged is None:
+        return read_agent_usage(Path("/nonexistent"), total_wall)
+    merged["span_s"] = total_wall
+    merged["agent_s"] = total_wall
+    merged["wall_ex_self_test_s"] = max(0.0, total_wall - float(merged.get("self_test_s") or 0.0))
+    merged["max_request_tokens"] = request_max
+    merged["mean_request_tokens"] = sum(means) / len(means) if means else 0.0
+    merged["other_s"] = max(
+        0.0,
+        total_wall
+        - float(merged.get("model_time_s") or 0.0)
+        - float(merged.get("tool_s") or 0.0)
+        - float(merged.get("self_test_s") or 0.0),
+    )
+    generation = float(merged.get("output_tokens") or 0.0) + float(
+        merged.get("reasoning_tokens") or 0.0
+    )
+    merged["gen_tokens_per_s"] = (
+        generation / float(merged["model_time_s"]) if merged.get("model_time_s") else None
+    )
+    merged["metrics_source"] = "round-logs"
+    return merged
+
+
 def workdir_manifest(root: Path) -> dict[str, str]:
     manifest: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
@@ -879,6 +1119,11 @@ def workdir_manifest(root: Path) -> dict[str, str]:
         ):
             continue
         if path.name == "PROMPT.md":
+            continue
+        if len(relative.parts) == 1 and (
+            path.name == "COMPLETION.md" or re.fullmatch(r"ROUND-.*\.md", path.name)
+        ):
+            # Harness-owned round prompts and clocks are not candidate changes.
             continue
         if str(relative).startswith("corpus/generated/"):
             continue
@@ -1034,11 +1279,13 @@ def run_tests(
     manifest: dict,
     fixture_seed: int,
     artifacts_dir: Path | None = None,
+    bin_dir: Path | None = None,
     require_single_cpu: bool = False,
     args: argparse.Namespace | None = None,
 ) -> dict:
     artifacts = artifacts_dir or (run_dir / "artifacts")
     artifacts.mkdir(parents=True, exist_ok=True)
+    bins = bin_dir or (artifacts / "bin")
     result_file = artifacts / "results.json"
     if result_file.exists():
         result_file.unlink()
@@ -1061,7 +1308,7 @@ def run_tests(
         "--tmpfs",
         "/perf:rw,size=6g,exec",
         "-v",
-        f"{artifacts / 'bin'}:/bins:ro",
+        f"{bins}:/bins:ro",
         "-v",
         f"{bundle}:/bundle.tar:ro",
         "-v",
@@ -1155,6 +1402,162 @@ def _result_error_summary(data: dict) -> str:
     if not data.get("perf_valid"):
         failed.append("perf-invalid")
     return ", ".join(failed[:12]) or "suite failed"
+
+
+def combine_repeat_results(results: list[dict], manifest: dict) -> dict:
+    """Combine repeated suite runs into one conservative result.
+
+    Correctness must pass in *every* repeat.  Per-workload throughput is the
+    median of the repeat speedups, which removes most of the effect of a single
+    unlucky measurement of the chosen checkpoint.  The returned dict has the
+    same shape as `run_tests` so callers and reports need no special case.
+    """
+    if not results:
+        return {
+            "result_valid": False,
+            "test_ok": False,
+            "result": None,
+            "error": "no final repeats were run",
+            "exit_code": None,
+        }
+    datas = [item.get("result") for item in results]
+    if any(data is None for data in datas):
+        errors = [str(item.get("error") or "missing results.json") for item in results]
+        return {
+            "result_valid": False,
+            "test_ok": False,
+            "result": next((data for data in datas if data is not None), None),
+            "error": "final repeat failed: " + "; ".join(errors[:3]),
+            "exit_code": results[0].get("exit_code"),
+            "repeats": len(results),
+        }
+    base = json.loads(json.dumps(datas[0]))
+    families: dict[str, dict[str, bool]] = {}
+    for data in datas:
+        for family, cases in ((data.get("correctness") or {}).get("families") or {}).items():
+            target = families.setdefault(family, {})
+            for case, ok in cases.items():
+                target[case] = bool(target.get(case, True) and ok)
+    base.setdefault("correctness", {})["families"] = families
+    perf = base.setdefault("perf", {})
+    for kind in ("decode", "encode"):
+        by_id: dict[str, list[dict]] = {}
+        for data in datas:
+            for item in ((data.get("perf") or {}).get(kind) or []):
+                by_id.setdefault(str(item.get("id")), []).append(item)
+        combined: list[dict] = []
+        for workload in by_id.values():
+            item = json.loads(json.dumps(workload[0]))
+            valid = all(bool(entry.get("valid")) for entry in workload) and len(workload) == len(datas)
+            item["valid"] = valid
+            item["validated"] = valid
+            speedups = [float(entry["speedup"]) for entry in workload if entry.get("valid")]
+            item["repeat_speedups"] = speedups
+            if valid and speedups:
+                item["speedup"] = statistics.median(speedups)
+                spread = (
+                    (max(speedups) - min(speedups)) / item["speedup"]
+                    if item["speedup"] > 0
+                    else 0.0
+                )
+                item["repeat_spread"] = spread
+                item["cv"] = max(float(item.get("cv") or 0.0), spread)
+            else:
+                item["speedup"] = 0.0
+                item["error"] = item.get("error") or "one or more final repeats were invalid"
+            combined.append(item)
+        perf[kind] = combined
+        perf[f"{kind}_valid"] = bool(
+            len(combined) == len(manifest["perf"][kind])
+            and all(bool(item.get("valid")) for item in combined)
+            and all(bool((data.get("perf") or {}).get(f"{kind}_valid")) for data in datas)
+        )
+        valid_values = [float(item["speedup"]) for item in combined if item.get("valid")]
+        perf[f"{kind}_speedup"] = _geomean(valid_values) if valid_values else 0.0
+    base["all_gates"] = all(bool(data.get("all_gates")) for data in datas)
+    base["perf_valid"] = all(bool(data.get("perf_valid")) for data in datas) and bool(
+        perf.get("decode_valid") and perf.get("encode_valid")
+    )
+    perf["stable"] = all(bool((data.get("perf") or {}).get("stable")) for data in datas)
+    base["repeats"] = len(datas)
+    perf["repeats"] = len(datas)
+    perf["statistic"] = "median per workload across final repeats"
+    base["repeat_scores"] = [
+        {
+            "decode_speedup": (data.get("perf") or {}).get("decode_speedup"),
+            "encode_speedup": (data.get("perf") or {}).get("encode_speedup"),
+            "duration_s": data.get("duration_s"),
+        }
+        for data in datas
+    ]
+    base["duration_s"] = round(sum(float(data.get("duration_s") or 0.0) for data in datas), 3)
+    base["exit"] = 0 if base["all_gates"] and base["perf_valid"] else 1
+    all_ok = all(bool(item.get("test_ok")) for item in results)
+    return {
+        "result_valid": True,
+        "test_ok": all_ok and base["all_gates"] and base["perf_valid"],
+        "result": base,
+        "error": None if base["all_gates"] and base["perf_valid"] else _result_error_summary(base),
+        "exit_code": 0 if base["all_gates"] and base["perf_valid"] else 1,
+        "repeats": len(results),
+    }
+
+
+def run_tests_repeated(
+    run_dir: Path,
+    *,
+    repeats: int,
+    engine: str,
+    image: str,
+    dry_run: bool,
+    manifest: dict,
+    fixture_seed: int,
+    artifacts_dir: Path,
+    bin_dir: Path | None = None,
+    require_single_cpu: bool = False,
+    args: argparse.Namespace | None = None,
+) -> dict:
+    """Run the hidden suite `repeats` times and combine the measurements."""
+    count = max(1, int(repeats))
+    results: list[dict] = []
+    try:
+        (artifacts_dir / "results.json").unlink()
+    except FileNotFoundError:
+        pass
+    for index in range(count):
+        target = artifacts_dir if count == 1 else artifacts_dir / f"repeat-{index + 1}"
+        target.mkdir(parents=True, exist_ok=True)
+        results.append(
+            run_tests(
+                run_dir,
+                engine=engine,
+                image=image,
+                dry_run=dry_run,
+                manifest=manifest,
+                fixture_seed=fixture_seed,
+                artifacts_dir=target,
+                bin_dir=bin_dir,
+                require_single_cpu=require_single_cpu,
+                args=args,
+            )
+        )
+    if count == 1:
+        return results[0]
+    if dry_run:
+        return results[0]
+    combined = combine_repeat_results(results, manifest)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    if combined.get("result") is not None:
+        (artifacts_dir / "results.json").write_text(
+            json.dumps(combined["result"], indent=2) + "\n", encoding="utf-8"
+        )
+    logs: list[str] = []
+    for index in range(count):
+        log_path = artifacts_dir / f"repeat-{index + 1}" / "test.log"
+        if log_path.exists():
+            logs.append(f"===== repeat {index + 1}/{count} =====\n" + log_path.read_text())
+    (artifacts_dir / "test.log").write_text("\n".join(logs), encoding="utf-8")
+    return combined
 
 
 def validate_result(data: object, manifest: dict) -> str | None:
@@ -1336,6 +1739,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- thinking: {meta.get('thinking', 'unknown')}"
         + (f" ({meta['reasoning_effort']})" if meta.get("reasoning_effort") else ""),
         f"- suite: {meta.get('suite_version')} (fixture {meta.get('fixture_seed')})",
+        f"- final grading: {meta.get('final_reps', 1)} repeat(s), median per workload",
         f"- wall: {format_duration(meta['wall_s'])}",
         "- budget: "
         + (
@@ -1348,6 +1752,15 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- watchdog: {meta['watchdog']}",
         f"- completion file: {meta['completion']}",
         f"- outcome: {meta.get('outcome', 'unknown')}",
+        *(
+            [
+                f"- provider errors: {meta['provider_error_count']} "
+                f"({meta.get('provider_recovered', 0)} recovered, "
+                f"{meta.get('provider_retries', 0)} retries)"
+            ]
+            if meta.get("provider_error_count")
+            else []
+        ),
         *(
             [
                 f"- agent error: {meta['agent_error'].get('type')} "
@@ -1386,8 +1799,8 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         "## Rounds",
         "",
-        "| round | budget | wall | watchdog | gates | validation score | final score |",
-        "|---|---:|---:|---|---:|---:|---:|",
+        "| round | budget | wall | watchdog | nudges | gates | validation score | final score |",
+        "|---|---:|---:|---|---:|---|---:|---:|",
     ]
     for row in meta.get("rounds") or []:
         validation = row.get("validation_score")
@@ -1395,6 +1808,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         lines.append(
             f"| {row.get('round')} | {format_duration(row.get('budget_s'))} | "
             f"{format_duration(row.get('wall_s'))} | {row.get('watchdog', '—')} | "
+            f"{row.get('nudges', 0)} | "
             f"{'pass' if row.get('gate_ok') else 'FAIL'} "
             f"({row.get('gate_pass')}/{row.get('gate_total')}) | "
             f"{validation:.1f} | "
@@ -1402,6 +1816,7 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
             if validation is not None and final is not None
             else f"| {row.get('round')} | {format_duration(row.get('budget_s'))} | "
             f"{format_duration(row.get('wall_s'))} | {row.get('watchdog', '—')} | "
+            f"{row.get('nudges', 0)} | "
             f"{'pass' if row.get('gate_ok') else 'FAIL'} "
             f"({row.get('gate_pass')}/{row.get('gate_total')}) | - | - |"
         )
@@ -1409,6 +1824,15 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         "Checkpoints use a validation corpus; the official score is the best eligible",
         "checkpoint rescored on a held-out final corpus.",
+    ]
+    if int(meta.get("final_reps") or 1) > 1:
+        lines.append(
+            f"Final grading is the median of {meta.get('final_reps')} rescore(s) "
+            "per workload, which reduces single-measurement noise."
+        )
+    lines += [
+        "The validation column is a single checkpoint measurement: it can move by",
+        "more than the real code difference. Treat the official score as the result.",
         "",
         "## Performance",
         "",
@@ -1434,9 +1858,11 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         )
     lines += [
         "",
-        "The score is seed-normalised. The untouched seed scores 0; matching the",
-        "frozen target in both dimensions scores 100. Correctness gates must all",
-        "pass for a result to be eligible.",
+        "Speedup is the median of paired seed/candidate ratios; min-of-N is a",
+        "diagnostic only (per-process fast modes are not shared). Seed and candidate",
+        "MP/s are medians. The score is seed-normalised. The untouched seed scores 0;",
+        "matching the frozen target in both dimensions scores 100. Correctness gates",
+        "must all pass for a result to be eligible.",
         "",
         "## Artifacts",
         "",
@@ -1720,6 +2146,12 @@ def print_summary(meta: dict, score: dict) -> None:
                 else ""
             )
         )
+    elif meta.get("provider_error_count"):
+        print(
+            f"  provider errors: {meta['provider_error_count']} "
+            f"({meta.get('provider_recovered', 0)} recovered, "
+            f"{meta.get('provider_retries', 0)} retries) — not fatal"
+        )
     print(
         f"  score {score['score']:.1f}"
         f"   decode x{score['decode_speedup']:.3f}"
@@ -1796,6 +2228,12 @@ def parse_round_plan(args: argparse.Namespace) -> list[float]:
     return values
 
 
+def _minutes(value: float) -> str:
+    rounded = max(0.0, float(value))
+    text = f"{rounded:g}"
+    return f"{text} minute" if abs(rounded - 1.0) < 1e-9 else f"{text} minutes"
+
+
 def _round_prompt_header(
     number: int,
     total: int,
@@ -1804,9 +2242,34 @@ def _round_prompt_header(
 ) -> str:
     return (
         f"# Round {number} of {total}\n\n"
-        f"This round has **{budget_minutes:g} minutes**; the total agent budget is "
-        f"**{remaining_minutes:g} minutes** remaining.\n\n"
+        f"This round has **{_minutes(budget_minutes)}**; the total agent budget is "
+        f"**{_minutes(remaining_minutes)}** remaining.\n\n"
+        f"The live round clock is in `/work/ROUND-TIME.md`; check `date -u` against "
+        f"its deadline.\n\n"
     )
+
+
+def write_round_time(
+    workdir: Path,
+    round_number: int,
+    budget_s: float,
+    started_at: float | None = None,
+) -> Path:
+    """Write the round clock the agent can read instead of guessing."""
+    start = time.time() if started_at is None else started_at
+    deadline = start + max(1.0, budget_s)
+    text = (
+        f"# Round {round_number} clock\n\n"
+        f"- started: {datetime.fromtimestamp(start, timezone.utc).isoformat(timespec='seconds')}\n"
+        f"- deadline: {datetime.fromtimestamp(deadline, timezone.utc).isoformat(timespec='seconds')}\n"
+        f"- budget: {budget_s / 60.0:.1f} minutes\n\n"
+        "Check the current time with `date -u`. Keep working while there is "
+        "useful, verified work to do; do not stop early. The interactive "
+        "`question` tool is disabled in this benchmark.\n"
+    )
+    path = workdir / "ROUND-TIME.md"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def write_round_one_prompt(workdir: Path, plan: list[float], args: argparse.Namespace) -> Path:
@@ -1835,9 +2298,56 @@ def write_round_one_prompt(workdir: Path, plan: list[float], args: argparse.Name
     return path
 
 
+def write_continue_prompt(workdir: Path, round_number: int, attempt: int, remaining_s: float) -> Path:
+    text = (
+        f"# Round {round_number} continues ({attempt})\n\n"
+        f"You still have about **{_minutes(remaining_s / 60.0)}** left in this "
+        "round. Your previous turn ended early, but the round is not over.\n\n"
+        "Keep working in `/work`: continue the highest-value optimisation you "
+        "identified, verify it against a pristine seed, and keep the CLI contract "
+        "and correctness gates intact. Do not write `COMPLETION.md` yet.\n\n"
+        "Read `/work/ROUND-TIME.md` for the round deadline and check `date -u`.\n"
+    )
+    path = workdir / f"ROUND-{round_number}-CONTINUE-{attempt}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def write_retry_prompt(
+    workdir: Path, round_number: int, attempt: int, error: dict | None
+) -> Path:
+    detail = ""
+    if error:
+        detail = (
+            f"The failure was `{error.get('type')}` ({error.get('status')}): "
+            f"{str(error.get('message') or '')[:300]}\n"
+        )
+    text = (
+        f"# Round {round_number} retry {attempt}\n\n"
+        "The provider failed at the transport level, not because of your work. "
+        "`/work` is exactly as you left it and this is the same session.\n\n"
+        + detail
+        + "\nContinue the round from the current state. Re-run the build and tests "
+        "before changing anything else, and do not redo work that already passes.\n"
+    )
+    path = workdir / f"ROUND-{round_number}-RETRY-{attempt}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
 def checkpoint_prompt_text(checkpoint: dict) -> str:
     score = checkpoint.get("score") or {}
     tests = checkpoint.get("tests") or {}
+    perf = (tests.get("result") or {}).get("perf") or {}
+
+    def band(kind: str) -> float:
+        values = [
+            float(item.get("ratio_ci95") or 0.0)
+            for item in perf.get(kind) or []
+            if item.get("valid")
+        ]
+        return max(values) if values else 0.0
+
     lines = [
         f"## Checkpoint after round {checkpoint.get('round')}",
         "",
@@ -1845,10 +2355,15 @@ def checkpoint_prompt_text(checkpoint: dict) -> str:
         f"- gates: {'pass' if score.get('gate_ok') else 'FAIL'} "
         f"({score.get('gate_pass', 0)}/{score.get('gate_total', 0)})",
         f"- decode speedup: x{float(score.get('decode_speedup') or 0):.3f} "
-        f"(target x{float(score.get('target_decode') or 0):.2f})",
+        f"(target x{float(score.get('target_decode') or 0):.2f}) "
+        f"+/-{band('decode'):.3f}",
         f"- encode speedup: x{float(score.get('encode_speedup') or 0):.3f} "
-        f"(target x{float(score.get('target_encode') or 0):.2f})",
+        f"(target x{float(score.get('target_encode') or 0):.2f}) "
+        f"+/-{band('encode'):.3f}",
         f"- validation score: {float(score.get('score') or 0):.1f}",
+        "- this checkpoint is a single measurement; differences inside the band "
+        "are noise, so keep changes that are clearly above it and re-measure "
+        "before drawing conclusions.",
     ]
     if tests.get("error"):
         lines.append(f"- suite note: {tests['error']}")
@@ -1877,14 +2392,17 @@ def write_next_round_prompt(
         + "\n\n"
         + "Keep the CLI contract and correctness gates intact. "
         + (
-            "This is the **final round**: do not start new optimizations. "
-            "Remove profiling/timing instrumentation, run `cargo build --release "
+            "This is the **final round**: the best eligible checkpoint is graded, "
+            "so optimizing is still allowed while time remains. **Freeze 10 "
+            "minutes before the deadline** in `/work/ROUND-TIME.md`: remove all "
+            "profiling/timing instrumentation, run `cargo build --release "
             "--offline --locked`, `cargo test --workspace --offline` and "
             "`python3 scripts/bench.py --reps 1`, then write `COMPLETION.md`. "
-            "The best eligible checkpoint is graded."
+            "Do not leave instrumentation or an unverified change in the tree."
             if is_final
             else "Do **not** write `COMPLETION.md` yet. Continue optimizing; the "
-            "next checkpoint will build and score your tree."
+            "next checkpoint will build and score your tree. If your turn ends "
+            "with time left, the harness will resume the session."
         )
         + "\n"
     )
@@ -1977,8 +2495,14 @@ def round_summary(row: dict) -> dict:
         "budget_s": row.get("budget_s"),
         "wall_s": row.get("wall_s"),
         "watchdog": row.get("watchdog"),
+        "nudges": int(row.get("nudges") or 0),
         "completion": row.get("completion"),
         "provider_error": bool(row.get("provider_error")),
+        "provider_error_count": len(row.get("provider_errors") or []),
+        "provider_recovered": len(
+            [event for event in (row.get("provider_errors") or []) if event.get("recovered")]
+        ),
+        "provider_retries": int(row.get("provider_retries") or 0),
         "build_ok": bool((row.get("build") or {}).get("build_ok")),
         "gate_ok": bool(validation.get("gate_ok")),
         "gate_pass": validation.get("gate_pass", 0),
@@ -2005,6 +2529,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     data_dir = run_dir / "opencode-data"
     data_dir.mkdir(parents=True, exist_ok=True)
     config_dir = resolve_config_dir(args.config, run_dir)
+    config_dir = prepare_agent_config(config_dir, run_dir)
     copy_seed(workdir)
 
     env_names = config_env_names(config_dir) | set(args.env or [])
@@ -2057,6 +2582,8 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 archived.unlink()
             completion.replace(archived)
 
+        round_started = time.time()
+        write_round_time(workdir, round_number, budget_s, round_started)
         if round_number == 1:
             prompt = write_round_one_prompt(workdir, plan, args)
         else:
@@ -2071,31 +2598,103 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             )
 
         print(f"\nround {round_number}/{total_rounds}  budget {format_duration(budget_s)}")
-        agent = start_agent(
-            model,
-            config_dir,
-            workdir,
-            data_dir,
-            run_dir,
-            env_names=env_names,
-            args=args,
-            round_number=round_number,
-            prompt_file=prompt,
-            session_id=session_id,
-            continue_session=bool(index > 0 and not session_id),
-            timeout_s=budget_s,
-            idle_timeout_s=idle_s,
-        )
-        provider_error = agent.get("provider_error")
-        if provider_error:
-            print(
-                f"  provider error: {provider_error.get('type')} "
-                f"({provider_error.get('status')}): {provider_error.get('message', '')[:160]}"
-            )
-        session_id = session_id or agent.get("session_id")
+        attempts: list[dict] = []
+        max_attempts = 1 + max(0, int(getattr(args, "provider_retries", 0)))
+        max_nudges = 0 if final_round else max(0, int(getattr(args, "max_nudges", 2)))
+        nudge_min = max(0.0, float(getattr(args, "nudge_min", 10.0)) * 60.0)
+        nudges = 0
+        continue_prompt: Path | None = None
+        while True:
+            provider_attempt = 0
+            run_attempts: list[dict] = []
+            while True:
+                attempt_budget = max(30.0, budget_s - (time.time() - round_started))
+                retry = provider_attempt > 0
+                if retry:
+                    prompt = write_retry_prompt(
+                        workdir,
+                        round_number,
+                        provider_attempt,
+                        attempts[-1].get("provider_error"),
+                    )
+                    log_suffix = f"-retry{provider_attempt}"
+                elif continue_prompt is not None:
+                    prompt = continue_prompt
+                    log_suffix = f"-continue{nudges}"
+                else:
+                    log_suffix = ""
+                agent = start_agent(
+                    model,
+                    config_dir,
+                    workdir,
+                    data_dir,
+                    run_dir,
+                    env_names=env_names,
+                    args=args,
+                    round_number=round_number,
+                    prompt_file=prompt,
+                    session_id=session_id,
+                    continue_session=True
+                    if (retry or continue_prompt is not None)
+                    else bool(index > 0 and not session_id),
+                    timeout_s=attempt_budget,
+                    idle_timeout_s=min(idle_s, attempt_budget),
+                    log_suffix=log_suffix,
+                    watch_completion=not retry,
+                )
+                attempts.append(agent)
+                run_attempts.append(agent)
+                provider_attempt += 1
+                provider_error = agent.get("provider_error")
+                for event in agent.get("provider_errors") or []:
+                    state = "recovered" if event.get("recovered") else "unrecovered"
+                    print(
+                        f"  provider error ({state}): {event.get('type')} "
+                        f"({event.get('status')}): {event.get('message', '')[:160]}"
+                    )
+                if provider_error is None:
+                    if agent.get("provider_errors"):
+                        print("  engine resumed after the provider error; continuing")
+                    break
+                if agent.get("provider_terminal") or provider_attempt >= max_attempts:
+                    break
+                delay = provider_retry_delay(agent, run_attempts, args)
+                left = budget_s - (time.time() - round_started)
+                if left <= delay + 60:
+                    print("  not enough round budget left to retry; keeping the checkpoint")
+                    break
+                print(
+                    f"  transient provider failure; retrying the round in "
+                    f"{format_duration(delay)} (attempt {provider_attempt + 1}/{max_attempts})"
+                )
+                time.sleep(delay)
+                session_id = session_id or agent.get("session_id")
+            session_id = session_id or attempts[-1].get("session_id")
+            agent = attempts[-1]
+            left = budget_s - (time.time() - round_started)
+            if (
+                not final_round
+                and provider_error is None
+                and not completion.exists()
+                and nudges < max_nudges
+                and left >= nudge_min
+                and agent.get("watchdog") == "exit"
+                and agent.get("agent_ok")
+            ):
+                nudges += 1
+                continue_prompt = write_continue_prompt(workdir, round_number, nudges, left)
+                print(
+                    f"  agent ended its turn with {format_duration(left)} left; "
+                    "resuming the session"
+                )
+                continue
+            break
+        session_id = session_id or attempts[-1].get("session_id")
+        agent = attempts[-1]
         log_path = Path(agent.get("log_path") or (run_dir / f"agent-round-{round_number}.log"))
-        metrics = read_agent_usage(log_path, float(agent["wall_s"]))
-        steps = count_log_steps(log_path)
+        metrics = combine_attempt_metrics(attempts)
+        steps = sum(count_log_steps(Path(item.get("log_path") or log_path)) for item in attempts)
+        round_wall = sum(float(item.get("wall_s") or 0.0) for item in attempts)
         integrity = integrity_scan(workdir)
         if integrity["problems"]:
             print("  integrity problems:")
@@ -2148,13 +2747,20 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             {
                 "round": round_number,
                 "budget_s": budget_s,
-                "wall_s": float(agent["wall_s"]),
+                "wall_s": round_wall,
                 "watchdog": agent["watchdog"],
+                "nudges": nudges,
                 "completion": bool(agent["completion"]),
                 "agent_ok": bool(agent["agent_ok"]),
                 "agent_exit_code": agent["agent_exit_code"],
                 "session_id": session_id,
                 "provider_error": provider_error,
+                "provider_errors": [
+                    {**event, "attempt": position + 1}
+                    for position, item in enumerate(attempts)
+                    for event in (item.get("provider_errors") or [])
+                ],
+                "provider_retries": len(attempts) - 1,
                 "metrics": metrics,
                 "steps": steps,
                 "integrity": integrity,
@@ -2165,6 +2771,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 "artifacts": str(round_dir / "artifacts"),
                 "source": str(round_dir / "source.tar"),
                 "agent_log": str(log_path),
+                "agent_logs": [str(item.get("log_path") or log_path) for item in attempts],
                 "final": None,
             }
         )
@@ -2181,9 +2788,10 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 archived.unlink()
             completion.replace(archived)
         if provider_error:
-            # A provider quota/rate-limit error is not a model failure and
-            # cannot be retried inside a 4-hour budget. Keep the checkpoint for
-            # diagnostics, then stop instead of burning later rounds.
+            # Quota/auth failures are terminal, and a transient failure that
+            # survived every retry means the provider is not answering. Keep
+            # the checkpoint, then stop instead of burning later rounds on a
+            # dead provider.
             break
 
     if args.dry_run:
@@ -2195,6 +2803,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         raise SystemExit("error: no rounds were executed")
 
     # Grade every eligible checkpoint on a held-out final corpus and keep the best.
+    final_reps = max(1, int(getattr(args, "final_reps", 2)))
     best: dict | None = None
     for row in rounds:
         artifacts = Path(row["artifacts"])
@@ -2206,14 +2815,16 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         (final_dir / "bin").mkdir(parents=True, exist_ok=True)
         shutil.copy2(candidate, final_dir / "bin" / "candidate")
         shutil.copy2(seed_bin, final_dir / "bin" / "seed")
-        final_tests = run_tests(
+        final_tests = run_tests_repeated(
             run_dir,
+            repeats=final_reps,
             engine=args.engine,
             image=args.test_image,
             dry_run=False,
             manifest=manifest,
             fixture_seed=final_seed,
             artifacts_dir=final_dir,
+            bin_dir=final_dir / "bin",
             require_single_cpu=not args.no_cpu_set,
             args=args,
         )
@@ -2270,6 +2881,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
 
     provider_errors = [row.get("provider_error") for row in rounds if row.get("provider_error")]
     agent_error = provider_errors[-1] if provider_errors else None
+    provider_events = [
+        {**event, "round": row.get("round")}
+        for row in rounds
+        for event in (row.get("provider_errors") or [])
+    ]
+    recovered_provider_errors = [event for event in provider_events if event.get("recovered")]
+    provider_retries = sum(int(row.get("provider_retries") or 0) for row in rounds)
     final_environment = (chosen_tests.get("result") or {}).get("environment") or {}
     final_score = dict(chosen_final) if chosen_final else {}
     if agent_error:
@@ -2309,8 +2927,13 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "rounds_count": len(rounds),
         "round_plan": args.round_plan if not args.no_rounds else "single",
         "best_round": best.get("round"),
+        "final_reps": final_reps,
         "confidence": "single-run",
         "agent_error": agent_error,
+        "provider_errors": provider_events,
+        "provider_error_count": len(provider_events),
+        "provider_recovered": len(recovered_provider_errors),
+        "provider_retries": provider_retries,
         "provider_retry_after_s": (
             float(agent_error.get("retry_after_ms")) / 1000.0
             if agent_error and agent_error.get("retry_after_ms")
@@ -2363,7 +2986,14 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "candidate_rss_bytes": manifest["limits"].get("candidate_rss_bytes"),
         "report": str(run_dir / "report.md"),
         "agent_log": str(rounds[0].get("agent_log") or (run_dir / "agent-round-1.log")),
-        "agent_logs": [str(row.get("agent_log") or (run_dir / f"agent-round-{row['round']}.log")) for row in rounds],
+        "agent_logs": [
+            str(path)
+            for row in rounds
+            for path in (
+                row.get("agent_logs")
+                or [row.get("agent_log") or (run_dir / f"agent-round-{row['round']}.log")]
+            )
+        ],
         "build_log": str(chosen_dir / "artifacts" / ".." / "build-run.log"),
         "test_log": str(chosen_dir / "final" / "test.log"),
     }
@@ -2743,6 +3373,61 @@ class _StaticHandler(BaseHTTPRequestHandler):
         pass
 
 
+def refresh_provider_status(meta: dict, run_dir: Path) -> bool:
+    """Recompute provider failures for a saved run from its agent logs.
+
+    Classification used to treat every provider error as terminal, including
+    engine blips that OpenCode retried in place. The logs are still on disk, so
+    rescoring an older run should not keep the old verdict.
+    """
+    rounds = meta.get("rounds") or []
+    before = json.dumps(meta.get("provider_errors")) + str(meta.get("agent_error"))
+    events: list[dict] = []
+    fatal: dict | None = None
+    for row in rounds:
+        number = row.get("round")
+        logs = sorted(
+            set(run_dir.glob(f"agent-round-{number}.log"))
+            | set(run_dir.glob(f"agent-round-{number}-retry*.log"))
+        )
+        analyses = [(log, analyze_provider_errors(log)) for log in logs]
+        row_events: list[dict] = []
+        for log, analysis in analyses:
+            for event in analysis["events"]:
+                entry = {**event, "round": number, "log": log.name}
+                row_events.append(entry)
+                events.append(entry)
+            if analysis["last_error"] and fatal is None:
+                fatal = analysis["last_error"]
+        if row_events:
+            row["provider_error_count"] = len(row_events)
+            row["provider_recovered"] = len(
+                [event for event in row_events if event.get("recovered")]
+            )
+        if analyses:
+            row["provider_error"] = any(
+                analysis["last_error"] for _, analysis in analyses
+            )
+    recovered = [event for event in events if event.get("recovered")]
+    if not events:
+        return False
+    meta["provider_errors"] = events
+    meta["provider_error_count"] = len(events)
+    meta["provider_recovered"] = len(recovered)
+    meta.setdefault("provider_retries", 0)
+    meta["agent_error"] = fatal
+    meta["agent_ok"] = fatal is None
+    if fatal is None and str(meta.get("outcome") or "") == "provider-error":
+        meta["outcome"] = classify_outcome(
+            watchdog=str(meta.get("watchdog") or "exit"),
+            completion=bool(meta.get("completion")),
+            files_changed=int(meta.get("files_changed") or 0),
+            agent_ok=True,
+        )
+    after = json.dumps(meta.get("provider_errors")) + str(meta.get("agent_error"))
+    return before != after
+
+
 def cmd_rescore(args: argparse.Namespace) -> int:
     run_id = getattr(args, "run_id", None) or args.run
     if not run_id:
@@ -2759,6 +3444,8 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     meta = json.loads(meta_path.read_text())
     workdir = run_dir / "workdir"
     manifest = load_manifest()
+    if refresh_provider_status(meta, run_dir):
+        print("  reclassified provider failures from the saved agent logs")
     rescore_dir = run_dir / "rescore"
     build = build_app(
         run_dir,
@@ -2768,14 +3455,16 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
         artifacts_dir=rescore_dir,
     )
-    tests = run_tests(
+    tests = run_tests_repeated(
         run_dir,
+        repeats=max(1, int(getattr(args, "final_reps", 2))),
         engine=args.engine,
         image=args.test_image,
         dry_run=args.dry_run,
         manifest=manifest,
         fixture_seed=int(meta.get("final_seed") or meta.get("fixture_seed") or manifest["seed"]),
         artifacts_dir=rescore_dir,
+        bin_dir=rescore_dir / "bin",
         require_single_cpu=not args.no_cpu_set,
         args=args,
     )
@@ -2785,10 +3474,15 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         manifest=manifest,
         result_valid=tests.get("result_valid", False),
     )
+    if meta.get("agent_error"):
+        score["eligible"] = False
+        score["score"] = 0.0
+        score["quality"] = 0.0
     meta.update(
         {
             "build_ok": build["build_ok"],
             "seed_build_ok": build.get("seed_build_ok", False),
+            "final_reps": max(1, int(getattr(args, "final_reps", 2))),
             "result_valid": score["result_valid"],
             "gate_ok": score["gate_ok"],
             "perf_valid": score["perf_valid"],
@@ -2809,6 +3503,9 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     )
     meta["test_log"] = str(rescore_dir / "test.log")
     meta["build_log"] = str(rescore_dir / "build-run.log")
+    for row in meta.get("rounds") or []:
+        if row.get("round") == meta.get("best_round"):
+            row["final_eligible"] = bool(score["eligible"])
     write_run_report(run_dir, meta, score)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     append_result(meta)
@@ -2925,6 +3622,10 @@ def submission_from_score(meta: dict) -> dict:
         "best_round": meta.get("best_round"),
         "confidence": meta.get("confidence"),
         "agent_error": agent_error,
+        "provider_errors": meta.get("provider_errors"),
+        "provider_error_count": meta.get("provider_error_count"),
+        "provider_recovered": meta.get("provider_recovered"),
+        "provider_retries": meta.get("provider_retries"),
         "provider_retry_after_s": meta.get("provider_retry_after_s"),
         "score": round(float(meta.get("score") or 0.0), 2),
         "eligible": eligible,
@@ -3140,7 +3841,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=int, default=4 * 3600)
     p.add_argument("--idle-timeout", type=int, default=3600)
     p.add_argument("--round-plan", default="75,75,45",
-                   help="comma-separated per-round minutes; last round is finalize")
+                   help="comma-separated per-round minutes; the last round is the "
+                        "final checkpoint")
     p.add_argument("--no-rounds", action="store_true",
                    help="single agent run using --timeout instead of checkpoints")
     p.add_argument("--fixture-seed", type=int)
@@ -3149,6 +3851,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pure", action="store_true")
     p.add_argument("--no-preflight", action="store_true")
     p.add_argument("--keep-going", action="store_true")
+    p.add_argument("--provider-retries", type=int, default=2,
+                   help="extra attempts for a round after a transient provider/engine failure")
+    p.add_argument("--provider-retry-delay", type=float, default=30.0,
+                   help="initial backoff in seconds before resuming a failed round")
+    p.add_argument("--max-nudges", type=int, default=2,
+                   help="resume the session this many times if the agent ends a "
+                        "non-final round with time left (0 disables)")
+    p.add_argument("--nudge-min", type=float, default=10.0,
+                   help="minimum minutes left before an early exit is resumed")
+    p.add_argument("--final-reps", type=int, default=2,
+                   help="repeat the held-out final grading this many times "
+                        "(median per-workload speedup; 1 disables)")
     p.add_argument("--hardware", default="")
     p.add_argument("--env", action="append", default=[])
     p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
@@ -3171,6 +3885,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rescore", help="rebuild and rerun a saved workdir")
     p.add_argument("run", nargs="?")
     p.add_argument("--run", dest="run_id")
+    p.add_argument("--final-reps", type=int, default=2,
+                   help="repeat the held-out grading this many times "
+                        "(median per-workload speedup; 1 disables)")
     p.set_defaults(func=cmd_rescore)
 
     p = sub.add_parser("preview", help="show a run's artifacts")

@@ -92,5 +92,9 @@
     }
   ],
   "agent_error": null,
+  "provider_errors": [],
+  "provider_error_count": 0,
+  "provider_recovered": 0,
+  "provider_retries": 0,
   "provider_retry_after_s": null
 }
