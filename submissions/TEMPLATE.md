@@ -17,7 +17,9 @@ Include the hardware line and the model/variant reference in the issue title.
 Results are self-reported unless a maintainer adds `verified`.
 
 The canonical schema is [`schema.json`](schema.json). The block printed by
-`bench.py submit` is what the site and issue form consume.
+`bench.py submit` is what the site and issue form consume. Include
+`network_policy` (`open` or `offline`), `cpu_set`, `rounds` and `confidence` so
+the page does not mix incompatible results.
 
 ## Ranking
 
@@ -28,4 +30,5 @@ on the local page.
 
 Only `eligible: true` runs with `gate_ok: true` and `perf_valid: true` should be
 treated as validated results. A self-reported run that fails a gate is not a
-codec result.
+codec result. One run is accepted, but `confidence: single-run` is noisy;
+three runs with different seeds are recommended.

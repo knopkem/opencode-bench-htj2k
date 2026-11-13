@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import unittest
@@ -190,6 +191,65 @@ class SubmissionTests(unittest.TestCase):
     def test_bad_submission(self) -> None:
         problems = bench.validate_submission({"schema": "nope"})
         self.assertTrue(problems)
+
+
+class HarnessTests(unittest.TestCase):
+    def test_cpu_set_flags(self) -> None:
+        args = argparse.Namespace(cpu_set="0", no_cpu_set=False)
+        self.assertEqual(bench.cpu_set_flags(args), ["--cpuset-cpus", "0", "--cpus", "1"])
+        args.no_cpu_set = True
+        self.assertEqual(bench.cpu_set_flags(args), [])
+
+    def test_round_plan(self) -> None:
+        args = argparse.Namespace(round_plan="75,75,45", no_rounds=False, timeout=14400)
+        self.assertEqual(bench.parse_round_plan(args), [75.0, 75.0, 45.0])
+        args.no_rounds = True
+        self.assertEqual(bench.parse_round_plan(args), [240.0])
+        with self.assertRaises(SystemExit):
+            bench.parse_round_plan(
+                argparse.Namespace(round_plan="0,75", no_rounds=False, timeout=14400)
+            )
+
+    def test_round_agent_command(self) -> None:
+        args = argparse.Namespace(
+            model="provider/model",
+            variant=None,
+            agent=None,
+            pure=False,
+            agent_cmd=None,
+        )
+        command = bench.agent_command(
+            args,
+            round_number=2,
+            prompt_file=bench.Path("ROUND-2.md"),
+            session_id="ses_123",
+        )
+        self.assertIn("--session ses_123", command)
+        self.assertIn("/work/ROUND-2.md", command)
+        command = bench.agent_command(args, round_number=2, continue_session=True)
+        self.assertIn("--continue", command)
+
+    def test_aggregate_single_and_multi_run(self) -> None:
+        row = {
+            "run_id": "a",
+            "model": "m",
+            "variant": "default",
+            "score": "30",
+            "eligible": "true",
+            "gate_ok": "true",
+            "decode_speedup": "1.2",
+            "encode_speedup": "1.1",
+            "model_time_s": "10",
+            "network_policy": "open",
+            "cpu_set": "0",
+        }
+        one = bench.aggregate_entries([dict(row)])
+        self.assertEqual(one[0]["runs"], 1)
+        self.assertEqual(one[0]["confidence"], "single-run")
+        multi = bench.aggregate_entries([dict(row), {**row, "run_id": "b", "score": "50"}, {**row, "run_id": "c", "score": "40"}])
+        self.assertEqual(multi[0]["runs"], 3)
+        self.assertEqual(multi[0]["confidence"], "multi-run")
+        self.assertEqual(multi[0]["median_score"], 40.0)
 
 
 class LeaderboardTests(unittest.TestCase):

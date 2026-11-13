@@ -23,8 +23,9 @@ containers.
 ./bench.py build                 # build agent and test images
 ./bench.py check                 # prompt, seed, manifest, images
 ./bench.py models                # local OpenCode providers/models
-./bench.py run --model provider/model
+./bench.py run --model provider/model          # 75/75/45 checkpointed rounds
 ./bench.py run --model provider/model --variant high
+./bench.py run --model provider/model --round-plan 90,90,30
 ./bench.py status
 ./bench.py report
 ./bench.py leaderboard           # serve + open the local page
@@ -35,6 +36,9 @@ python3 -m unittest discover -s tests
 
 Docker/OrbStack must be running (`docker info`). The harness reads the local
 OpenCode configuration; there is no model list or credential in this repo.
+Both the agent and grader containers are pinned to one CPU with
+`--cpuset-cpus 0` by default. That makes `nproc` and
+`available_parallelism()` report 1, so local measurements match grading.
 
 ## What the model does
 
@@ -44,9 +48,14 @@ correctness gate. The model must keep the CLI and codestream contract while
 making decode and encode faster.
 
 The hidden suite is mounted only after the agent exits. The test container has
-no network, runs on one CPU, and executes the candidate as an unprivileged user.
-The independent C++ OpenJPH oracle lives in a mode-700 directory that the
+no network, runs on one pinned CPU, and executes the candidate as an unprivileged
+user. The independent C++ OpenJPH oracle lives in a mode-700 directory that the
 candidate cannot read.
+
+The agent run is split into three rounds (75 / 75 / 45 minutes). After each round
+the harness builds the workdir and reports gate status and speedups on a
+validation corpus. The last round is stabilization only. The official score is
+the best eligible checkpoint, rescored on a held-out final corpus.
 
 ## Grading
 
@@ -74,9 +83,10 @@ scores `100`; targets are derived from the seed/OpenJPH ratios on the reference
 machine with a 1.25x floor. Correctness failure means ineligible and `0`.
 
 The frozen catalog is `tasks/htj2k/tests/manifest.json`: suite `htj2k-v1`,
-per-run fixture seed, ten encode+decode cases, five decode-only layouts, a DICOM
-`.201` fixture, malformed-input checks and four decode plus four encode
-throughput workloads.
+per-run validation and held-out final seeds, ten encode+decode cases, five
+decode-only layouts, a DICOM `.201` fixture, malformed-input checks and four
+decode plus four encode throughput workloads. Checkpoints use the validation
+seed; the official score uses the final seed.
 
 ## Frozen limits
 
@@ -84,6 +94,9 @@ throughput workloads.
 |---|---:|
 | Agent wall clock | 4 h |
 | Agent idle timeout | 1 h |
+| Agent/grader CPU | 1 pinned CPU (`--cpuset-cpus 0`) |
+| Round plan | 75 / 75 / 45 min |
+| Held-out final corpus | yes |
 | Candidate memory cap | 2 GiB |
 | File deadline | 120 s |
 | Perf suite deadline | 15 min |
@@ -111,7 +124,7 @@ bench.py                       harness, Docker orchestration, scoring, leaderboa
 docker/agent.Dockerfile        Ubuntu + Rust + OpenCode (no oracle)
 docker/test.Dockerfile         Ubuntu + Rust + Python + pinned C++ OpenJPH oracle
 tasks/htj2k/PROMPT.md          candidate-visible contract
-tasks/htj2k/seed/              candidate-visible codec, CLI and public benchmark
+tasks/htj2k/seed/              codec, CLI, public benchmark and public fixtures
 tasks/htj2k/tests/             hidden suite, manifest, corpus and oracle
 tasks/htj2k/CALIBRATION.md     reference measurements and target derivation
 submissions/                   community submission schema and example
@@ -120,18 +133,24 @@ tests/test_bench.py            harness/scoring unit tests
 
 ## Hidden-suite validation
 
-The seed must pass all gates and score `0.0` with no changes. The independent
-oracle must decode every fixture. Negative controls and repeated runs are
-maintainer release gates; see `AGENTS.md`.
+The seed must pass all gates and score `0.0` with no changes. `./bench.py check`
+verifies that both containers report one pinned CPU. The independent oracle must
+decode every fixture. Negative controls and repeated runs are maintainer release
+gates; see `AGENTS.md`.
 
 ## Trust model
 
 The agent container has network access for the model provider. A model could look
 up OpenJPH source online; the seed is already a port of it, so the gain is
-limited, but this is **capability evidence, not a security boundary**. The
-hidden corpus is regenerated per run and expected pixels never enter the
-candidate process. Community submissions are self-reported unless a maintainer
-adds `verified`.
+limited, but this is **capability evidence, not a security boundary**. Results
+record `network: open`; do not compare them directly with offline/local-model
+results. The hidden corpus is regenerated per run and expected pixels never enter
+the candidate process.
+
+One run is accepted on the local leaderboard, but it is labelled `single-run`
+and is low-confidence. Three runs with different seeds are recommended for a
+strong claim. Community submissions are self-reported unless a maintainer adds
+`verified`.
 
 ## License and attribution
 

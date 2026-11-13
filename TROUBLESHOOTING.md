@@ -21,15 +21,36 @@ outside the allowlist.
 
 The test image compiles both the candidate workdir and the pristine seed. A seed
 failure is a harness/infrastructure error, not a model failure. Check
-`runs/<id>/artifacts/build-seed.log`. Do not accept a score produced with a
-broken seed.
+`runs/<id>/rounds/round-N/artifacts/build-seed.log`. Do not accept a score
+produced with a broken seed.
+
+## `check` says the image is not pinned to one CPU
+
+The harness runs both agent and grader with `--cpuset-cpus 0 --cpus 1`. If the
+engine does not support cpuset, `check` fails instead of silently using a
+quota-only limit. Use Docker Desktop/OrbStack, or pass `--cpu-set` for a
+supported CPU. `--no-cpu-set` is for debugging only.
 
 ## Performance looks noisy
 
-The test container is limited to one CPU and the runner interleaves pristine seed
+The test container is pinned to one CPU and the runner interleaves pristine seed
 and candidate measurements. On a busy host, medians can still move by a few
 percent. Repeat the run before drawing conclusions; do not compare absolute MP/s
-across machines.
+across machines. A threaded local benchmark on an unpinned container is not a
+valid result: check `nproc` first.
+
+## The run stopped early / rounds
+
+The default plan is 75 / 75 / 45 minutes with a checkpoint after each round. The
+last round is stabilization only. If the model exits early, the next round starts
+from the same session and workdir. The official score is the best eligible
+checkpoint rescored on a held-out final corpus. Look at
+`runs/<id>/rounds/round-N/` and `rounds` in `score.json`.
+
+## The leaderboard shows a single run
+
+One run is accepted but labelled `single-run`. Run three times with different
+seeds for a multi-run median; the page groups rows by model and variant.
 
 ## `p0.dicom-201` fails
 
@@ -44,7 +65,8 @@ cmp /tmp/out.raw tasks/htj2k/tests/fixtures/ABDOM_1_raw.u16le
 ## `p0.robustness` fails
 
 A candidate that exits `0` on truncated or garbage input, hangs, or crashes with
-a signal is a failure. Check `test.log` for the case and the return code. The
+a signal is a failure. Check `rounds/round-N/final/test.log` for the case and the
+return code. The
 runner distinguishes a non-zero clean failure from a timeout or signal.
 
 ## The scorer gives 0 even though the codec is faster

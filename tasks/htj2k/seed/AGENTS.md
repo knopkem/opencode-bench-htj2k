@@ -1,7 +1,9 @@
 # HTJ2K seed — agent notes
 
 This is the candidate-visible codec. The harness copies this directory to the
-run workdir and gives the agent four hours. The hidden suite is not here.
+run workdir and gives the agent four hours across checkpointed rounds. The hidden
+suite is not here. The grader exposes exactly one pinned CPU; thread-based
+parallelism will not help.
 
 ## Layout
 
@@ -33,9 +35,14 @@ build with `--offline --locked`.
 python3 scripts/bench.py --reps 3
 ```
 
-It generates raw images under `corpus/generated/`, runs the same CLI calls the
-hidden suite uses, and prints encode/decode MP/s. Use it to compare a modified
-tree against a pristine copy. Public fixtures are small and are not the score.
+It first checks the committed public fixtures under `corpus/public/` against the
+independent oracle's codestreams, then generates raw images under
+`corpus/generated/`, runs the same CLI calls the hidden suite uses, and prints
+encode/decode MP/s. Use it to compare a modified tree against a pristine copy.
+Public fixtures are small and are not the score.
+
+The public fixtures cover 64x64, 16x16, 4x1024, RPCL and a tiled codestream.
+`--skip-fixtures` skips the interop check during quick iterations.
 
 ## Contract
 

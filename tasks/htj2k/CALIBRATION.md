@@ -8,6 +8,8 @@ targets. It is a maintainer record, not a score input.
 - Apple Silicon (arm64), macOS, Rust 1.99 host build for the seed.
 - C++ oracle: OpenJPH 0.26.3, `-O3`, Release, static library.
 - Candidate and seed are the same binary for the no-op calibration.
+- Agent and test containers pinned to one CPU with `--cpuset-cpus 0 --cpus 1`.
+  `nproc` and `sched_getaffinity` report 1.
 - Measurements are end-to-end CLI runs (file I/O included), median of seven,
   interleaved.
 
@@ -15,17 +17,17 @@ targets. It is a maintainer record, not a score input.
 
 | kind | workload | seed MP/s | C++ OpenJPH MP/s | oracle/seed |
 |---|---|---:|---:|---:|
-| decode | 12-bit 2048² 4x1024 | 62.4 | 78.3 | 1.25 |
-| decode | 8-bit 2048² 64x64 | 73.3 | 118.9 | 1.62 |
-| decode | 16-bit 2048² 4x1024 | 66.6 | 80.5 | 1.21 |
-| decode | 12-bit 1536² 64x64 | 71.2 | 107.5 | 1.51 |
-| encode | 12-bit 2048² 4x1024 | 43.4 | 35.9 | 0.83 |
-| encode | 8-bit 2048² 4x1024 | 50.0 | 45.6 | 0.91 |
-| encode | 16-bit 2048² 4x1024 | 45.8 | 44.0 | 0.96 |
-| encode | 12-bit 1536² 4x1024 | 40.5 | 34.8 | 0.86 |
+| decode | 12-bit 2048² 4x1024 | 104.1 | 128.4 | 1.23 |
+| decode | 8-bit 2048² 64x64 | 122.0 | 181.8 | 1.49 |
+| decode | 16-bit 2048² 4x1024 | 108.3 | 128.5 | 1.19 |
+| decode | 12-bit 1536² 64x64 | 104.2 | 178.3 | 1.71 |
+| encode | 12-bit 2048² 4x1024 | 72.4 | 69.2 | 0.96 |
+| encode | 8-bit 2048² 4x1024 | 83.0 | 78.9 | 0.95 |
+| encode | 16-bit 2048² 4x1024 | 81.2 | 73.2 | 0.90 |
+| encode | 12-bit 1536² 4x1024 | 67.8 | 59.9 | 0.88 |
 
 These are the single-CPU Docker measurements used for the frozen targets.
-Geometric mean oracle/seed: decode ≈ 1.39, encode ≈ 0.89.
+Geometric mean oracle/seed: decode ≈ 1.39, encode ≈ 0.92.
 
 ## Targets
 

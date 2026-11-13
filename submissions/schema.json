@@ -14,39 +14,183 @@
     "encode_speedup"
   ],
   "properties": {
-    "schema": { "const": "opencode-bench/htj2k-result@1" },
-    "run_id": { "type": "string", "minLength": 1 },
-    "timestamp": { "type": "string" },
-    "model": { "type": "string", "minLength": 1 },
-    "provider": { "type": "string" },
-    "hardware": { "type": "string" },
-    "variant": { "type": "string" },
-    "thinking": { "type": "string" },
-    "reasoning_effort": { "type": "string" },
-    "suite_version": { "const": "htj2k-v1" },
-    "fixture_seed": { "type": "integer" },
-    "score": { "type": "number", "minimum": 0, "maximum": 200 },
-    "eligible": { "type": "boolean" },
-    "gate_ok": { "type": "boolean" },
-    "perf_valid": { "type": "boolean" },
-    "decode_speedup": { "type": "number", "exclusiveMinimum": 0 },
-    "encode_speedup": { "type": "number", "exclusiveMinimum": 0 },
-    "target_decode": { "type": "number", "minimum": 1 },
-    "target_encode": { "type": "number", "minimum": 1 },
-    "decode_seed_mp_s": { "type": ["number", "null"] },
-    "decode_candidate_mp_s": { "type": ["number", "null"] },
-    "encode_seed_mp_s": { "type": ["number", "null"] },
-    "encode_candidate_mp_s": { "type": ["number", "null"] },
-    "gates": { "type": "array" },
-    "wall_s": { "type": ["number", "null"] },
-    "model_time_s": { "type": ["number", "null"] },
-    "input_tokens": { "type": ["integer", "null"] },
-    "output_tokens": { "type": ["integer", "null"] },
-    "reasoning_tokens": { "type": ["integer", "null"] },
-    "total_tokens": { "type": ["integer", "null"] },
-    "watchdog": { "type": "string" },
-    "outcome": { "type": "string" },
-    "verified": { "type": "boolean" }
+    "schema": {
+      "const": "opencode-bench/htj2k-result@1"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provider": {
+      "type": "string"
+    },
+    "hardware": {
+      "type": "string"
+    },
+    "variant": {
+      "type": "string"
+    },
+    "thinking": {
+      "type": "string"
+    },
+    "reasoning_effort": {
+      "type": "string"
+    },
+    "suite_version": {
+      "const": "htj2k-v1"
+    },
+    "fixture_seed": {
+      "type": "integer"
+    },
+    "score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 200
+    },
+    "eligible": {
+      "type": "boolean"
+    },
+    "gate_ok": {
+      "type": "boolean"
+    },
+    "perf_valid": {
+      "type": "boolean"
+    },
+    "decode_speedup": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "encode_speedup": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "target_decode": {
+      "type": "number",
+      "minimum": 1
+    },
+    "target_encode": {
+      "type": "number",
+      "minimum": 1
+    },
+    "decode_seed_mp_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "decode_candidate_mp_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "encode_seed_mp_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "encode_candidate_mp_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "gates": {
+      "type": "array"
+    },
+    "wall_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "model_time_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "input_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "output_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "reasoning_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "total_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "watchdog": {
+      "type": "string"
+    },
+    "outcome": {
+      "type": "string"
+    },
+    "verified": {
+      "type": "boolean"
+    },
+    "validation_seed": {
+      "type": "integer"
+    },
+    "final_seed": {
+      "type": "integer"
+    },
+    "cpu_set": {
+      "type": "string"
+    },
+    "cpu_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "network_policy": {
+      "type": "string",
+      "enum": [
+        "open",
+        "offline"
+      ]
+    },
+    "rounds_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "best_round": {
+      "type": "integer"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "single-run",
+        "multi-run"
+      ]
+    },
+    "rounds": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
   },
   "additionalProperties": true
 }

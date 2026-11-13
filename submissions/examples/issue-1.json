@@ -23,11 +23,36 @@
   "encode_seed_mp_s": 47.9,
   "encode_candidate_mp_s": 51.7,
   "gates": [
-    {"id": "p0.decode-lossless", "ok": true, "passed": 15, "total": 15},
-    {"id": "p0.encode-lossless", "ok": true, "passed": 10, "total": 10},
-    {"id": "p0.dicom-201", "ok": true, "passed": 1, "total": 1},
-    {"id": "p0.robustness", "ok": true, "passed": 5, "total": 5},
-    {"id": "p0.determinism", "ok": true, "passed": 1, "total": 1}
+    {
+      "id": "p0.decode-lossless",
+      "ok": true,
+      "passed": 15,
+      "total": 15
+    },
+    {
+      "id": "p0.encode-lossless",
+      "ok": true,
+      "passed": 10,
+      "total": 10
+    },
+    {
+      "id": "p0.dicom-201",
+      "ok": true,
+      "passed": 1,
+      "total": 1
+    },
+    {
+      "id": "p0.robustness",
+      "ok": true,
+      "passed": 5,
+      "total": 5
+    },
+    {
+      "id": "p0.determinism",
+      "ok": true,
+      "passed": 1,
+      "total": 1
+    }
   ],
   "wall_s": 7210.0,
   "model_time_s": 4690.0,
@@ -37,5 +62,33 @@
   "total_tokens": 867000,
   "watchdog": "exit",
   "outcome": "completed",
-  "verified": false
+  "verified": false,
+  "validation_seed": 123456788,
+  "final_seed": 123456789,
+  "cpu_set": "0",
+  "cpu_count": 1,
+  "network_policy": "open",
+  "rounds_count": 3,
+  "best_round": 2,
+  "confidence": "single-run",
+  "rounds": [
+    {
+      "round": 1,
+      "validation_score": 41.2,
+      "final_score": 44.0,
+      "gate_ok": true
+    },
+    {
+      "round": 2,
+      "validation_score": 58.1,
+      "final_score": 61.4,
+      "gate_ok": true
+    },
+    {
+      "round": 3,
+      "validation_score": 60.3,
+      "final_score": 59.8,
+      "gate_ok": true
+    }
+  ]
 }

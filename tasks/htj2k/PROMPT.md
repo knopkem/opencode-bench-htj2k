@@ -11,10 +11,19 @@ This is a performance-engineering task, not a format-design task. HTJ2K is a
 standard; the bitstream must remain decodable by an independent C++ OpenJPH
 oracle. You may restructure the Rust implementation freely.
 
-## Budget and priorities
+## Budget, CPU and checkpoints
 
 - You have up to **4 hours** of wall time (hard cap) and a **1-hour** no-output
-  timeout. Stop and write `COMPLETION.md` when done or nearly out of time.
+  timeout. The run is split into **75 / 75 / 45 minute rounds** with a checkpoint
+  after each. The last round is for stabilization only.
+- The grader exposes **exactly one CPU**. `available_parallelism()` is 1.
+  Thread-based parallelism will not help; do not build a thread pool.
+- After each round the harness builds your tree and tells you the gate status
+  and decode/encode speedups on a validation corpus. The final score is the best
+  eligible checkpoint, rescored on a held-out final corpus.
+- Do **not** write `COMPLETION.md` until the final round. In the final round,
+  remove profiling/timing instrumentation, run the public tests and write
+  `COMPLETION.md`.
 - Correctness is a gate. A fast codec that produces wrong pixels scores `0`.
 - Optimise in this order: **decode correctness, encode correctness, decode
   speed, encode speed**. The score weights decode and encode equally.

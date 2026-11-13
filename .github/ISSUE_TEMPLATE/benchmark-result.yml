@@ -8,6 +8,8 @@ body:
       value: |
         Use `./bench.py submit --run RUN_ID --print` and paste the JSON block.
         Results are self-reported unless a maintainer adds `verified`.
+        The block includes the CPU set, network policy, round count and confidence.
+        One run is accepted but is labelled `single-run`; three runs are recommended.
   - type: input
     id: model
     attributes:

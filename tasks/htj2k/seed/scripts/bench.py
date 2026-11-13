@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import statistics
 import subprocess
@@ -23,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = ROOT / "target" / "release" / "htj2k"
 CORPUS = ROOT / "corpus" / "generated"
+PUBLIC = ROOT / "corpus" / "public"
 
 WORKLOADS = [
     {"id": "gray-12-1536-d5-4x1024", "width": 1536, "height": 1536, "bit_depth": 12, "decompositions": 5, "block_size": "4x1024"},
@@ -62,17 +64,80 @@ def run(command: list[str]) -> float:
     return elapsed
 
 
+def check_public_fixtures(binary: Path) -> None:
+    manifest_path = PUBLIC / "manifest.json"
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text())
+    cases = manifest.get("cases") or []
+    if not cases:
+        return
+    CORPUS.mkdir(parents=True, exist_ok=True)
+    print(f"public fixtures ({len(cases)})")
+    for case in cases:
+        j2c = PUBLIC / case["j2c"]
+        raw = PUBLIC / case["raw"]
+        decoded = CORPUS / f"public-{case['id']}.decoded.raw"
+        run([str(binary), "decode", str(j2c), str(decoded)])
+        if decoded.read_bytes() != raw.read_bytes():
+            raise SystemExit(f"public fixture decode mismatch: {case['id']}")
+        encoded = CORPUS / f"public-{case['id']}.self.j2c"
+        roundtrip = CORPUS / f"public-{case['id']}.self.raw"
+        run(
+            [
+                str(binary),
+                "encode",
+                str(raw),
+                str(encoded),
+                "--width",
+                str(case["width"]),
+                "--height",
+                str(case["height"]),
+                "--bit-depth",
+                str(case["bit_depth"]),
+                "--components",
+                "1",
+                "--decompositions",
+                str(case["decompositions"]),
+                "--block-size",
+                case["block_size"],
+                "--progression",
+                case["progression"],
+            ]
+        )
+        run([str(binary), "decode", str(encoded), str(roundtrip)])
+        if roundtrip.read_bytes() != raw.read_bytes():
+            raise SystemExit(f"public fixture roundtrip mismatch: {case['id']}")
+        print(f"  {case['id']}: ok")
+        decoded.unlink(missing_ok=True)
+        encoded.unlink(missing_ok=True)
+        roundtrip.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default=str(DEFAULT_BINARY))
     parser.add_argument("--reps", type=int, default=3)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--skip-fixtures", action="store_true")
     args = parser.parse_args()
     binary = Path(args.binary)
     if not binary.exists():
         raise SystemExit(f"missing {binary}; run cargo build --release --offline --locked")
+    try:
+        affinity = len(os.sched_getaffinity(0))
+    except AttributeError:
+        affinity = os.cpu_count() or 1
+    if affinity != 1:
+        print(
+            f"WARNING: {affinity} CPUs visible; the grader pins one CPU. "
+            "Run under `taskset -c 0` or a --cpuset-cpus container for comparable numbers.",
+            file=sys.stderr,
+        )
 
     CORPUS.mkdir(parents=True, exist_ok=True)
+    if not args.skip_fixtures:
+        check_public_fixtures(binary)
     results = []
     for index, workload in enumerate(WORKLOADS):
         raw = CORPUS / f"{workload['id']}.raw"

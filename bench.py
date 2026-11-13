@@ -8,13 +8,16 @@ task runs in Docker:
   * the agent container sees only a fresh copy of the seed workdir;
   * the hidden suite, pristine seed, corpus generator and independent C++ OpenJPH
     oracle are mounted only after the agent exits;
-  * the test container has no network and a single-CPU budget.
+  * the test container has no network and one pinned CPU;
+  * the agent run is checkpointed, and the best eligible checkpoint is graded
+    on a held-out final corpus.
 
 Usage:
     ./bench.py build
     ./bench.py check
     ./bench.py models
-    ./bench.py run --model provider/model
+    ./bench.py run --model provider/model          # 75/75/45 checkpointed rounds
+    ./bench.py run --model provider/model --round-plan 90,90,30
     ./bench.py report
     ./bench.py leaderboard
 """
@@ -65,6 +68,8 @@ DEFAULT_TEST_IMAGE = os.environ.get(
     "OPENCODE_BENCH_TEST_IMAGE", "opencode-bench-htj2k-test:latest"
 )
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
+DEFAULT_CPU_SET = os.environ.get("OPENCODE_BENCH_CPUSET", "0")
+DEFAULT_NETWORK_POLICY = os.environ.get("OPENCODE_BENCH_NETWORK", "open")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
 
 TEST_SCHEMA = "opencode-bench/htj2k-tests@1"
@@ -107,6 +112,9 @@ SOURCE_BAN_RE = re.compile(
     r"|\bTcpStream\b"
     r"|\bUdpSocket\b"
     r")"
+)
+THREAD_RE = re.compile(
+    r"(?:\bstd::thread\b|\bthread::scope\b|\bavailable_parallelism\b|\brayon\b)"
 )
 ALLOWED_LOCK_PACKAGES = {
     "htj2k",
@@ -162,6 +170,15 @@ CSV_FIELDS = [
     "suite_version",
     "fixture_seed",
     "image",
+    "cpu_set",
+    "cpu_count",
+    "network_policy",
+    "rounds",
+    "round_plan",
+    "best_round",
+    "validation_seed",
+    "final_seed",
+    "confidence",
     "budget_wall_cap_s",
     "budget_idle_timeout_s",
     "build_ok",
@@ -304,6 +321,23 @@ def image_exists(engine: str, image: str) -> bool:
         ).returncode == 0
     except FileNotFoundError:
         return False
+
+
+def cpu_set_flags(args: argparse.Namespace) -> list[str]:
+    """Docker flags that make one CPU visible to the process, not just a quota."""
+    if getattr(args, "no_cpu_set", False):
+        return []
+    value = (getattr(args, "cpu_set", None) or "").strip()
+    if not value:
+        return []
+    return ["--cpuset-cpus", value, "--cpus", "1"]
+
+
+def effective_cpu_count() -> int:
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:
+        return os.cpu_count() or 1
 
 
 # --------------------------------------------------------------------------- #
@@ -497,24 +531,39 @@ def copy_seed(destination: Path) -> None:
     shutil.copy2(PROMPT_PATH, destination / "PROMPT.md")
 
 
-def agent_command(args: argparse.Namespace) -> str:
+def agent_command(
+    args: argparse.Namespace,
+    *,
+    round_number: int = 1,
+    prompt_file: Path | None = None,
+    session_id: str | None = None,
+    continue_session: bool = False,
+) -> str:
+    prompt_name = f"ROUND-{round_number}.md" if round_number > 1 else "PROMPT.md"
+    if prompt_file is not None:
+        prompt_name = prompt_file.name
     if getattr(args, "agent_cmd", None):
         template = args.agent_cmd
         return (
             template.replace("{workdir}", "/work")
-            .replace("{prompt_file}", "/work/PROMPT.md")
+            .replace("{prompt_file}", f"/work/{prompt_name}")
             .replace("{model}", args.model or "")
             .replace("{variant}", args.variant or "")
         )
     model_ref = '"$OPENCODE_BENCH_MODEL"'
     if args.variant:
         model_ref = '"${OPENCODE_BENCH_MODEL}#${OPENCODE_BENCH_VARIANT}"'
-    parts = [f"exec opencode run --format json --auto --model {model_ref}"]
+    parts = ["exec opencode run --format json --auto"]
+    if session_id:
+        parts.append(f"--session {shlex.quote(session_id)}")
+    elif continue_session:
+        parts.append("--continue")
+    parts.append(f"--model {model_ref}")
     if args.agent:
         parts.append(f"--agent {shlex.quote(args.agent)}")
     if args.pure:
         parts.append("--pure")
-    parts.append('"$(cat /work/PROMPT.md)"')
+    parts.append(f'"$(cat /work/{prompt_name})"')
     return " ".join(parts)
 
 
@@ -527,9 +576,15 @@ def start_agent(
     *,
     env_names: set[str],
     args: argparse.Namespace,
+    round_number: int = 1,
+    prompt_file: Path | None = None,
+    session_id: str | None = None,
+    continue_session: bool = False,
+    timeout_s: float | None = None,
+    idle_timeout_s: float | None = None,
 ) -> dict:
     name = f"opencode-bench-htj2k-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
-    log_path = run_dir / "agent.log"
+    log_path = run_dir / f"agent-round-{round_number}.log"
     command = [
         args.engine,
         "run",
@@ -537,6 +592,7 @@ def start_agent(
         "--name",
         name,
         "--shm-size=1g",
+        *cpu_set_flags(args),
         "-v",
         f"{workdir}:/work",
         "-v",
@@ -560,7 +616,13 @@ def start_agent(
         args.agent_image,
         "bash",
         "-c",
-        agent_command(args),
+        agent_command(
+            args,
+            round_number=round_number,
+            prompt_file=prompt_file,
+            session_id=session_id,
+            continue_session=continue_session,
+        ),
     ]
     if args.dry_run:
         print("+ " + " ".join(shlex.quote(part) for part in command))
@@ -574,6 +636,8 @@ def start_agent(
         }
 
     start = time.time()
+    round_timeout = float(timeout_s if timeout_s is not None else args.timeout)
+    round_idle = float(idle_timeout_s if idle_timeout_s is not None else args.idle_timeout)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as handle:
         handle.write("+ " + " ".join(shlex.quote(part) for part in command) + "\n\n")
@@ -605,10 +669,10 @@ def start_agent(
             if completion_seen_at is not None and now - completion_seen_at > 60:
                 watchdog = "completion"
                 break
-            if now - start > args.timeout:
+            if now - start > round_timeout:
                 watchdog = "hard"
                 break
-            if now - last_change > args.idle_timeout:
+            if now - last_change > round_idle:
                 watchdog = "idle"
                 break
             time.sleep(2)
@@ -627,6 +691,7 @@ def start_agent(
     wall_s = time.time() - start
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     self_tests = len(SELF_TEST_RE.findall(log_text))
+    session_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', log_text)
     return {
         "wall_s": wall_s,
         "watchdog": watchdog,
@@ -634,6 +699,8 @@ def start_agent(
         "agent_ok": proc.returncode == 0,
         "agent_exit_code": proc.returncode,
         "self_test_runs": self_tests,
+        "session_id": session_match.group(1) if session_match else None,
+        "log_path": str(log_path),
     }
 
 
@@ -824,6 +891,10 @@ def integrity_scan(workdir: Path) -> dict:
                 continue
             if SOURCE_BAN_RE.search(line):
                 problems.append(f"{relative}:{line_number}: forbidden construct: {line.strip()[:160]}")
+            elif THREAD_RE.search(line):
+                warnings.append(
+                    f"{relative}:{line_number}: thread-based code is ineffective on the pinned one-CPU grader"
+                )
     lock_path = workdir / "Cargo.lock"
     if lock_path.exists():
         text = lock_path.read_text(encoding="utf-8", errors="replace")
@@ -843,8 +914,16 @@ def integrity_scan(workdir: Path) -> dict:
     return {"problems": problems, "warnings": warnings, "ok": not problems}
 
 
-def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run: bool) -> dict:
-    artifacts = run_dir / "artifacts"
+def build_app(
+    run_dir: Path,
+    workdir: Path,
+    *,
+    engine: str,
+    image: str,
+    dry_run: bool,
+    artifacts_dir: Path | None = None,
+) -> dict:
+    artifacts = artifacts_dir or (run_dir / "artifacts")
     artifacts.mkdir(parents=True, exist_ok=True)
     command = [
         engine,
@@ -876,7 +955,10 @@ def build_app(run_dir: Path, workdir: Path, *, engine: str, image: str, dry_run:
         "test -x /out/bin/candidate && test -x /out/bin/seed",
     ]
     proc = run_command(
-        command, log_path=run_dir / "build-run.log", dry_run=dry_run, timeout=900
+        command,
+        log_path=artifacts.parent / "build-run.log",
+        dry_run=dry_run,
+        timeout=900,
     )
     if dry_run:
         return {"build_ok": True, "seed_build_ok": True, "typecheck_ok": True, "binary": True}
@@ -906,12 +988,16 @@ def run_tests(
     dry_run: bool,
     manifest: dict,
     fixture_seed: int,
+    artifacts_dir: Path | None = None,
+    require_single_cpu: bool = False,
+    args: argparse.Namespace | None = None,
 ) -> dict:
-    artifacts = run_dir / "artifacts"
+    artifacts = artifacts_dir or (run_dir / "artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
     result_file = artifacts / "results.json"
     if result_file.exists():
         result_file.unlink()
-    bundle = run_dir / "tests-bundle.tar"
+    bundle = artifacts.parent / "tests-bundle.tar"
     if not dry_run:
         with tarfile.open(bundle, "w") as archive:
             for name in ("runner.py", "corpus.py", "manifest.json"):
@@ -924,8 +1010,7 @@ def run_tests(
         "--rm",
         "--network",
         "none",
-        "--cpus",
-        "1",
+        *(cpu_set_flags(args) if args is not None else ["--cpus", "1"]),
         "--memory",
         "4g",
         "--tmpfs",
@@ -954,12 +1039,16 @@ def run_tests(
         "--manifest /opt/private/manifest.json "
         "--fixtures /opt/private/fixtures "
         "--out /out --scratch /perf "
-        f"--run-seed {fixture_seed}",
+        f"--run-seed {fixture_seed}"
+        + (" --require-single-cpu" if require_single_cpu else ""),
     ]
     timeout = float(manifest["limits"].get("perf_deadline_s", 900)) + 300
     try:
         proc = run_command(
-            command, log_path=run_dir / "test.log", dry_run=dry_run, timeout=timeout
+            command,
+            log_path=artifacts / "test.log",
+            dry_run=dry_run,
+            timeout=timeout,
         )
     except subprocess.TimeoutExpired:
         return {
@@ -1195,6 +1284,9 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- model: `{meta['model']}`",
         f"- provider: {meta['provider']}",
         *([f"- hardware: {meta['hardware']}"] if meta.get("hardware") else []),
+        f"- cpu: {meta.get('cpu_set')} (effective {meta.get('cpu_count')})",
+        f"- network: {meta.get('network_policy')} (grader is always offline)",
+        f"- rounds: {meta.get('rounds_count')} ({meta.get('round_plan')}); best {meta.get('best_round')}",
         f"- variant: {meta.get('variant', 'default')}",
         f"- thinking: {meta.get('thinking', 'unknown')}"
         + (f" ({meta['reasoning_effort']})" if meta.get("reasoning_effort") else ""),
@@ -1233,6 +1325,32 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         lines.append(f"| {row['id']} | {row['passed']}/{row['total']} | {failed} |")
     lines += [
         "",
+        "## Rounds",
+        "",
+        "| round | budget | wall | watchdog | gates | validation score | final score |",
+        "|---|---:|---:|---|---:|---:|---:|",
+    ]
+    for row in meta.get("rounds") or []:
+        validation = row.get("validation_score")
+        final = row.get("final_score")
+        lines.append(
+            f"| {row.get('round')} | {format_duration(row.get('budget_s'))} | "
+            f"{format_duration(row.get('wall_s'))} | {row.get('watchdog', '—')} | "
+            f"{'pass' if row.get('gate_ok') else 'FAIL'} "
+            f"({row.get('gate_pass')}/{row.get('gate_total')}) | "
+            f"{validation:.1f} | "
+            f"{final:.1f} |"
+            if validation is not None and final is not None
+            else f"| {row.get('round')} | {format_duration(row.get('budget_s'))} | "
+            f"{format_duration(row.get('wall_s'))} | {row.get('watchdog', '—')} | "
+            f"{'pass' if row.get('gate_ok') else 'FAIL'} "
+            f"({row.get('gate_pass')}/{row.get('gate_total')}) | - | - |"
+        )
+    lines += [
+        "",
+        "Checkpoints use a validation corpus; the official score is the best eligible",
+        "checkpoint rescored on a held-out final corpus.",
+        "",
         "## Performance",
         "",
         "| kind | workload | seed MP/s | candidate MP/s | reference MP/s | speedup |",
@@ -1261,11 +1379,9 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         "",
         "## Artifacts",
         "",
-        "- `agent.log`",
-        "- `build-run.log`",
-        "- `artifacts/build-candidate.log`",
-        "- `test.log`",
-        "- `artifacts/results.json`",
+        "- agent round logs: " + ", ".join(f"`{Path(path).name}`" for path in meta.get("agent_logs") or []),
+        "- per-round `build-run.log`, `test.log`, `results.json` and `source.tar`",
+        "- `rounds/<best>/final/results.json`",
         "",
     ]
     (run_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
@@ -1293,6 +1409,9 @@ def write_result_rows(rows: list[dict]) -> None:
 
 
 def append_result(row: dict) -> None:
+    row = dict(row)
+    if isinstance(row.get("rounds"), list):
+        row["rounds"] = len(row["rounds"])
     with results_lock():
         rows = read_result_rows()
         rows = [existing for existing in rows if existing.get("run_id") != row.get("run_id")]
@@ -1348,12 +1467,96 @@ def _fmt(value: object, digits: int = 3) -> str:
         return "—"
 
 
+def _median(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
+
+
+def aggregate_entries(rows: list[dict]) -> list[dict]:
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for row in rows:
+        if not row.get("run_id"):
+            continue
+        key = (str(row.get("model") or "?"), str(row.get("variant") or "default"))
+        groups.setdefault(key, []).append(row)
+    entries: list[dict] = []
+    for (model, variant), group in groups.items():
+        all_scores = [score_row(row) for row in group]
+        eligible_rows = [
+            row for row in group if str(row.get("eligible", "")).lower() == "true"
+        ]
+        scored_rows = eligible_rows or group
+        scores = [score_row(row) for row in scored_rows]
+        gate_values = [
+            1.0 if str(row.get("gate_ok", "")).lower() == "true" else 0.0
+            for row in group
+        ]
+        decode = [
+            float(row.get("decode_speedup"))
+            for row in scored_rows
+            if _float(row.get("decode_speedup")) is not None
+        ]
+        encode = [
+            float(row.get("encode_speedup"))
+            for row in scored_rows
+            if _float(row.get("encode_speedup")) is not None
+        ]
+        model_time = [
+            float(row.get("model_time_s"))
+            for row in scored_rows
+            if _float(row.get("model_time_s")) is not None
+        ]
+        entries.append(
+            {
+                "model": model,
+                "variant": variant,
+                "runs": len(group),
+                "eligible_runs": len(eligible_rows),
+                "median_score": _median(scores) or 0.0,
+                "best_score": max(all_scores) if all_scores else 0.0,
+                "gate_rate": sum(gate_values) / len(gate_values) if gate_values else 0.0,
+                "median_decode": _median(decode),
+                "median_encode": _median(encode),
+                "median_model_time": _median(model_time),
+                "confidence": "multi-run" if len(group) >= 3 else "single-run",
+                "network": sorted({str(row.get("network_policy") or "unknown") for row in group}),
+                "cpu": sorted({str(row.get("cpu_set") or "unknown") for row in group}),
+            }
+        )
+    entries.sort(
+        key=lambda entry: (
+            -entry["median_score"],
+            entry["median_model_time"] if entry["median_model_time"] is not None else float("inf"),
+            entry["model"],
+            entry["variant"],
+        )
+    )
+    return entries
+
+
 def _esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
 def render_leaderboard(rows: list[dict]) -> str:
     entries = leaderboard_entries(rows)
+    summaries = aggregate_entries(rows)
+    summary_body = []
+    for index, entry in enumerate(summaries, 1):
+        summary_body.append(
+            "<tr>"
+            f"<td>{index}</td>"
+            f"<td><code>{_esc(entry['model'])}</code></td>"
+            f"<td>{_esc(entry['variant'])}</td>"
+            f"<td>{entry['runs']}</td>"
+            f"<td>{entry['median_score']:.1f}</td>"
+            f"<td>{entry['best_score']:.1f}</td>"
+            f"<td>{entry['gate_rate'] * 100:.0f}%</td>"
+            f"<td>{_esc(_fmt(entry['median_decode']))}</td>"
+            f"<td>{_esc(_fmt(entry['median_encode']))}</td>"
+            f"<td>{_esc(entry['confidence'])}</td>"
+            f"<td>{_esc(', '.join(entry['network']))}</td>"
+            "</tr>"
+        )
     body = []
     for index, entry in enumerate(entries, 1):
         status = "eligible" if entry["_eligible"] else "ineligible"
@@ -1366,6 +1569,8 @@ def render_leaderboard(rows: list[dict]) -> str:
             f"<td>{_esc(entry.get('decode_speedup', '—'))}</td>"
             f"<td>{_esc(entry.get('encode_speedup', '—'))}</td>"
             f"<td>{status}</td>"
+            f"<td>{_esc(entry.get('cpu_set', '—'))}</td>"
+            f"<td>{_esc(entry.get('network_policy', '—'))}</td>"
             f"<td>{_esc(entry.get('hardware', ''))}</td>"
             f"<td>{format_duration(entry.get('wall_s'))}</td>"
             f"<td>{format_tokens(entry.get('total_tokens'))}</td>"
@@ -1381,6 +1586,7 @@ def render_leaderboard(rows: list[dict]) -> str:
 <style>
 body {{ font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #111; }}
 h1 {{ font-size: 1.5rem; }}
+h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
 table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
 th, td {{ border-bottom: 1px solid #ddd; padding: .5rem .6rem; text-align: left; vertical-align: top; }}
 th {{ background: #f5f5f5; font-weight: 600; }}
@@ -1392,12 +1598,22 @@ code {{ font-size: .9em; }}
 <h1>opencode-bench-htj2k</h1>
 <p class="note">Lossless HTJ2K encode/decode optimisation. Score is seed-normalised:
 the untouched seed is 0, matching the frozen target in both dimensions is 100.
-Correctness gates must pass for eligibility. Rows are local artifacts unless a
-community submission says otherwise.</p>
+Correctness gates must pass for eligibility. One run is accepted, but single-run
+entries are low-confidence; three runs with different seeds are recommended.
+The grader runs on one pinned CPU; the agent network is labelled per run.
+Rows are local artifacts unless a community submission says otherwise.</p>
+<h2>Models</h2>
 <table>
-<thead><tr><th>#</th><th>model</th><th>variant</th><th>score</th><th>decode</th><th>encode</th><th>status</th><th>hardware</th><th>wall</th><th>tokens</th><th>run</th></tr></thead>
+<thead><tr><th>#</th><th>model</th><th>variant</th><th>runs</th><th>median score</th><th>best</th><th>gate rate</th><th>decode</th><th>encode</th><th>confidence</th><th>network</th></tr></thead>
 <tbody>
-{''.join(body) or '<tr><td colspan="11">no runs yet</td></tr>'}
+{''.join(summary_body) or '<tr><td colspan="11">no runs yet</td></tr>'}
+</tbody>
+</table>
+<h2>Runs</h2>
+<table>
+<thead><tr><th>#</th><th>model</th><th>variant</th><th>score</th><th>decode</th><th>encode</th><th>status</th><th>cpu</th><th>network</th><th>hardware</th><th>wall</th><th>tokens</th><th>run</th></tr></thead>
+<tbody>
+{''.join(body) or '<tr><td colspan="13">no runs yet</td></tr>'}
 </tbody>
 </table>
 </body>
@@ -1426,6 +1642,23 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   encode x{score['encode_speedup']:.3f}"
         f"   {'ELIGIBLE' if score['eligible'] else 'not eligible'}"
     )
+    rounds = meta.get("rounds") or []
+    if rounds:
+        print(
+            f"  rounds {len(rounds)}"
+            f"   best {meta.get('best_round')}"
+            f"   cpu {meta.get('cpu_set')}"
+            f"   network {meta.get('network_policy')}"
+        )
+        for row in rounds:
+            final = row.get("final_score")
+            print(
+                f"    round {row.get('round')}: "
+                f"gates {'pass' if row.get('gate_ok') else 'FAIL'}"
+                f"  validation {float(row.get('validation_score') or 0):.1f}"
+                + (f"  final {float(final):.1f}" if final is not None else "")
+                + f"  watchdog {row.get('watchdog')}"
+            )
     print(
         f"  wall {format_duration(meta['wall_s'])}"
         f"   model {format_duration(meta.get('model_time_s'))}"
@@ -1458,6 +1691,226 @@ def claim_run_dir(base_id: str) -> tuple[str, Path]:
     return run_id, path
 
 
+def parse_round_plan(args: argparse.Namespace) -> list[float]:
+    if getattr(args, "no_rounds", False):
+        return [max(1.0, float(args.timeout) / 60.0)]
+    raw = str(getattr(args, "round_plan", "75,75,45"))
+    values: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            value = float(part)
+        except ValueError:
+            raise SystemExit(f"error: invalid --round-plan value {part!r}")
+        if value <= 0:
+            raise SystemExit("error: round budgets must be positive")
+        values.append(value)
+    if not values:
+        raise SystemExit("error: --round-plan is empty")
+    return values
+
+
+def _round_prompt_header(
+    number: int,
+    total: int,
+    budget_minutes: float,
+    remaining_minutes: float,
+) -> str:
+    return (
+        f"# Round {number} of {total}\n\n"
+        f"This round has **{budget_minutes:g} minutes**; the total agent budget is "
+        f"**{remaining_minutes:g} minutes** remaining.\n\n"
+    )
+
+
+def write_round_one_prompt(workdir: Path, plan: list[float], args: argparse.Namespace) -> Path:
+    total = len(plan)
+    schedule = " / ".join(f"{value:g}m" for value in plan)
+    final_note = (
+        "This is the only round: optimize, then finish with **COMPLETION.md**."
+        if total == 1
+        else (
+            "Do **not** write `COMPLETION.md` until the final round. "
+            "After each round the harness builds your tree and reports gate status "
+            "and speedups; the best eligible checkpoint is graded on a held-out corpus."
+        )
+    )
+    text = (
+        _round_prompt_header(1, total, plan[0], sum(plan))
+        + f"Schedule: **{schedule}**.\n\n"
+        + "Read `/work/PROMPT.md` first; it contains the task contract, limits and scoring.\n\n"
+        + "The grader exposes **exactly one CPU** (`available_parallelism()` is 1). "
+        "Thread-based parallelism will not help.\n\n"
+        + final_note
+        + "\n\nWork only in `/work`. Good luck.\n"
+    )
+    path = workdir / "ROUND-1.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def checkpoint_prompt_text(checkpoint: dict) -> str:
+    score = checkpoint.get("score") or {}
+    tests = checkpoint.get("tests") or {}
+    lines = [
+        f"## Checkpoint after round {checkpoint.get('round')}",
+        "",
+        f"- build: {'ok' if checkpoint.get('build', {}).get('build_ok') else 'FAILED'}",
+        f"- gates: {'pass' if score.get('gate_ok') else 'FAIL'} "
+        f"({score.get('gate_pass', 0)}/{score.get('gate_total', 0)})",
+        f"- decode speedup: x{float(score.get('decode_speedup') or 0):.3f} "
+        f"(target x{float(score.get('target_decode') or 0):.2f})",
+        f"- encode speedup: x{float(score.get('encode_speedup') or 0):.3f} "
+        f"(target x{float(score.get('target_encode') or 0):.2f})",
+        f"- validation score: {float(score.get('score') or 0):.1f}",
+    ]
+    if tests.get("error"):
+        lines.append(f"- suite note: {tests['error']}")
+    failed: list[str] = []
+    for gate in score.get("gates") or []:
+        for case, ok in (gate.get("cases") or {}).items():
+            if not ok:
+                failed.append(f"{gate.get('id')}:{case}")
+    if failed:
+        lines += ["", "Failed gates:", *[f"- `{item}`" for item in failed[:30]]]
+    return "\n".join(lines)
+
+
+def write_next_round_prompt(
+    workdir: Path,
+    number: int,
+    total: int,
+    plan: list[float],
+    checkpoint: dict,
+    remaining_s: float,
+) -> Path:
+    is_final = number == total
+    text = (
+        _round_prompt_header(number, total, plan[number - 1], max(1.0, remaining_s / 60.0))
+        + checkpoint_prompt_text(checkpoint)
+        + "\n\n"
+        + "Keep the CLI contract and correctness gates intact. "
+        + (
+            "This is the **final round**: do not start new optimizations. "
+            "Remove profiling/timing instrumentation, run `cargo build --release "
+            "--offline --locked`, `cargo test --workspace --offline` and "
+            "`python3 scripts/bench.py --reps 1`, then write `COMPLETION.md`. "
+            "The best eligible checkpoint is graded."
+            if is_final
+            else "Do **not** write `COMPLETION.md` yet. Continue optimizing; the "
+            "next checkpoint will build and score your tree."
+        )
+        + "\n"
+    )
+    path = workdir / f"ROUND-{number}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def snapshot_source(workdir: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(destination, "w") as archive:
+        for path in sorted(workdir.rglob("*")):
+            if not path.is_file():
+                continue
+            relative = path.relative_to(workdir)
+            if any(part in {"target", ".git", "__pycache__"} for part in relative.parts):
+                continue
+            if str(relative).startswith("corpus/generated/"):
+                continue
+            archive.add(path, arcname=str(relative))
+
+
+def count_log_steps(path: Path) -> int:
+    try:
+        return len(re.findall(r'"type":"step_finish"', path.read_text(errors="replace")))
+    except OSError:
+        return 0
+
+
+def aggregate_agent_metrics(rounds: list[dict]) -> dict:
+    metrics = {
+        "span_s": 0.0,
+        "agent_s": 0.0,
+        "ttft_s": 0.0,
+        "think_s": 0.0,
+        "output_s": 0.0,
+        "model_time_s": 0.0,
+        "tool_s": 0.0,
+        "other_s": 0.0,
+        "tool_shell_s": 0.0,
+        "tool_write_s": 0.0,
+        "tool_read_s": 0.0,
+        "tool_other_s": 0.0,
+        "self_test_s": 0.0,
+        "self_test_runs": 0,
+        "build_tool_s": 0.0,
+        "wall_ex_self_test_s": 0.0,
+        "retries": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "max_request_tokens": 0,
+        "mean_request_tokens": 0,
+        "gen_tokens_per_s": None,
+        "metrics_source": "round-logs",
+        "metrics_version": 1,
+    }
+    for row in rounds:
+        source = row.get("metrics") or {}
+        for key in metrics:
+            if key in {"max_request_tokens", "mean_request_tokens", "gen_tokens_per_s", "metrics_source", "metrics_version"}:
+                continue
+            value = source.get(key)
+            if isinstance(value, (int, float)):
+                metrics[key] += value
+        metrics["max_request_tokens"] = max(
+            metrics["max_request_tokens"], int(source.get("max_request_tokens") or 0)
+        )
+    if rounds:
+        means = [
+            float(row["metrics"].get("mean_request_tokens") or 0)
+            for row in rounds
+            if row.get("metrics", {}).get("mean_request_tokens") is not None
+        ]
+        metrics["mean_request_tokens"] = sum(means) / len(means) if means else 0
+        generation = metrics["output_tokens"] + metrics["reasoning_tokens"]
+        if metrics["model_time_s"] > 0:
+            metrics["gen_tokens_per_s"] = generation / metrics["model_time_s"]
+    return metrics
+
+
+def round_summary(row: dict) -> dict:
+    validation = row.get("score") or {}
+    final = (row.get("final") or {}).get("score") or {}
+    return {
+        "round": row.get("round"),
+        "budget_s": row.get("budget_s"),
+        "wall_s": row.get("wall_s"),
+        "watchdog": row.get("watchdog"),
+        "completion": row.get("completion"),
+        "build_ok": bool((row.get("build") or {}).get("build_ok")),
+        "gate_ok": bool(validation.get("gate_ok")),
+        "gate_pass": validation.get("gate_pass", 0),
+        "gate_total": validation.get("gate_total", 0),
+        "validation_score": validation.get("score", 0.0),
+        "validation_decode": validation.get("decode_speedup", 0.0),
+        "validation_encode": validation.get("encode_speedup", 0.0),
+        "validation_eligible": bool(validation.get("eligible")),
+        "final_score": final.get("score") if final else None,
+        "final_decode": final.get("decode_speedup") if final else None,
+        "final_encode": final.get("encode_speedup") if final else None,
+        "final_eligible": bool(final.get("eligible")) if final else False,
+        "artifacts": row.get("artifacts"),
+        "source": row.get("source"),
+    }
+
+
 def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | None) -> dict:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     variant_slug = slug(variant) if variant else "default"
@@ -1480,80 +1933,253 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
 
     thinking, effort = model_thinking(model, variant)
     variant_label = variant or "default"
+    manifest = load_manifest()
+    plan = parse_round_plan(args)
+    base_seed = int(args.fixture_seed or manifest.get("seed", 1))
+    run_hash = int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16)
+    validation_seed = base_seed ^ run_hash
+    final_seed = base_seed ^ (run_hash ^ 0x5EED5EED)
     print(f"run {run_id}")
     print(f"  workdir {workdir}")
     print(f"  model   {model}")
     print(f"  config  {config_dir}")
     print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant_label}")
+    print(f"  cpu     {args.cpu_set if not args.no_cpu_set else 'unpinned'}  network={args.network_policy}")
+    print(f"  rounds  {' / '.join(f'{value:g}m' for value in plan)}")
 
-    agent = start_agent(
-        model,
-        config_dir,
-        workdir,
-        data_dir,
-        run_dir,
-        env_names=env_names,
-        args=args,
-    )
-    steps = len(re.findall(r'"type":"step_finish"', (run_dir / "agent.log").read_text(errors="replace"))) if (run_dir / "agent.log").exists() else 0
-    metrics = read_agent_usage(run_dir / "agent.log", float(agent["wall_s"]))
-    files_changed = count_changed_files(workdir)
-    outcome = classify_outcome(
-        watchdog=agent["watchdog"],
-        completion=agent["completion"],
-        files_changed=files_changed,
-        agent_ok=agent["agent_ok"],
-    )
-    integrity = integrity_scan(workdir)
-    if integrity["problems"]:
-        print("integrity problems:")
-        for problem in integrity["problems"]:
-            print(f"  - {problem}")
+    rounds: list[dict] = []
+    session_id: str | None = None
+    run_started = time.time()
+    total_rounds = len(plan)
 
-    manifest = load_manifest()
-    fixture_seed = int(args.fixture_seed or manifest.get("seed", 1)) ^ (
-        int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16) & 0x7FFFFFFF
-    )
-    build = build_app(
-        run_dir,
-        workdir,
-        engine=args.engine,
-        image=args.test_image,
-        dry_run=args.dry_run,
-    )
+    for index, minutes in enumerate(plan):
+        round_number = index + 1
+        final_round = round_number == total_rounds
+        round_dir = run_dir / "rounds" / f"round-{round_number}"
+        round_dir.mkdir(parents=True, exist_ok=True)
+        elapsed = time.time() - run_started
+        remaining = max(0.0, float(args.timeout) - elapsed)
+        if index > 0 and remaining < 30:
+            print("  no time left for another round; stopping")
+            break
+        budget_s = max(10.0, min(float(minutes) * 60.0, remaining or float(minutes) * 60.0))
+        idle_s = min(float(args.idle_timeout), budget_s)
+
+        completion = workdir / "COMPLETION.md"
+        if completion.exists() and not final_round:
+            archived = round_dir / "COMPLETION.md"
+            if archived.exists():
+                archived.unlink()
+            completion.replace(archived)
+
+        if round_number == 1:
+            prompt = write_round_one_prompt(workdir, plan, args)
+        else:
+            previous = rounds[-1] if rounds else {}
+            prompt = write_next_round_prompt(
+                workdir,
+                round_number,
+                total_rounds,
+                plan,
+                previous,
+                max(0.0, float(args.timeout) - (time.time() - run_started)),
+            )
+
+        print(f"\nround {round_number}/{total_rounds}  budget {format_duration(budget_s)}")
+        agent = start_agent(
+            model,
+            config_dir,
+            workdir,
+            data_dir,
+            run_dir,
+            env_names=env_names,
+            args=args,
+            round_number=round_number,
+            prompt_file=prompt,
+            session_id=session_id,
+            continue_session=bool(index > 0 and not session_id),
+            timeout_s=budget_s,
+            idle_timeout_s=idle_s,
+        )
+        session_id = session_id or agent.get("session_id")
+        log_path = Path(agent.get("log_path") or (run_dir / f"agent-round-{round_number}.log"))
+        metrics = read_agent_usage(log_path, float(agent["wall_s"]))
+        steps = count_log_steps(log_path)
+        integrity = integrity_scan(workdir)
+        if integrity["problems"]:
+            print("  integrity problems:")
+            for problem in integrity["problems"]:
+                print(f"    - {problem}")
+
+        build = build_app(
+            run_dir,
+            workdir,
+            engine=args.engine,
+            image=args.test_image,
+            dry_run=args.dry_run,
+            artifacts_dir=round_dir / "artifacts",
+        )
+        if integrity["problems"]:
+            build["build_ok"] = False
+        if build["build_ok"]:
+            tests = run_tests(
+                run_dir,
+                engine=args.engine,
+                image=args.test_image,
+                dry_run=args.dry_run,
+                manifest=manifest,
+                fixture_seed=validation_seed,
+                artifacts_dir=round_dir / "artifacts",
+                require_single_cpu=not args.no_cpu_set,
+                args=args,
+            )
+        else:
+            tests = {
+                "result_valid": False,
+                "test_ok": False,
+                "result": None,
+                "error": "candidate build failed; suite not run",
+                "exit_code": None,
+            }
+        score = score_run(
+            tests,
+            build,
+            manifest=manifest,
+            result_valid=tests.get("result_valid", False),
+        )
+        if integrity["problems"]:
+            score["eligible"] = False
+            score["score"] = 0.0
+            score["gate_ok"] = False
+            score["perf_valid"] = False
+        snapshot_source(workdir, round_dir / "source.tar")
+        rounds.append(
+            {
+                "round": round_number,
+                "budget_s": budget_s,
+                "wall_s": float(agent["wall_s"]),
+                "watchdog": agent["watchdog"],
+                "completion": bool(agent["completion"]),
+                "agent_ok": bool(agent["agent_ok"]),
+                "agent_exit_code": agent["agent_exit_code"],
+                "session_id": session_id,
+                "metrics": metrics,
+                "steps": steps,
+                "integrity": integrity,
+                "build": build,
+                "tests": tests,
+                "score": score,
+                "dir": str(round_dir),
+                "artifacts": str(round_dir / "artifacts"),
+                "source": str(round_dir / "source.tar"),
+                "agent_log": str(log_path),
+                "final": None,
+            }
+        )
+        print(
+            f"  checkpoint {round_number}: gates "
+            f"{'pass' if score['gate_ok'] else 'FAIL'} "
+            f"({score['gate_pass']}/{score['gate_total']}), "
+            f"decode x{score['decode_speedup']:.3f}, encode x{score['encode_speedup']:.3f}, "
+            f"validation score {score['score']:.1f}"
+        )
+        if completion.exists() and not final_round:
+            archived = round_dir / "COMPLETION.md"
+            if archived.exists():
+                archived.unlink()
+            completion.replace(archived)
+
     if args.dry_run:
         print("dry run complete; no score or report written")
         shutil.rmtree(run_dir, ignore_errors=True)
         return {}
-    if integrity["problems"]:
-        build["build_ok"] = False
-    if build["build_ok"]:
-        tests = run_tests(
+
+    if not rounds:
+        raise SystemExit("error: no rounds were executed")
+
+    # Grade every eligible checkpoint on a held-out final corpus and keep the best.
+    best: dict | None = None
+    for row in rounds:
+        artifacts = Path(row["artifacts"])
+        candidate = artifacts / "bin" / "candidate"
+        seed_bin = artifacts / "bin" / "seed"
+        if not candidate.exists() or not seed_bin.exists():
+            continue
+        final_dir = Path(row["dir"]) / "final"
+        (final_dir / "bin").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(candidate, final_dir / "bin" / "candidate")
+        shutil.copy2(seed_bin, final_dir / "bin" / "seed")
+        final_tests = run_tests(
             run_dir,
             engine=args.engine,
             image=args.test_image,
-            dry_run=args.dry_run,
+            dry_run=False,
             manifest=manifest,
-            fixture_seed=fixture_seed,
+            fixture_seed=final_seed,
+            artifacts_dir=final_dir,
+            require_single_cpu=not args.no_cpu_set,
+            args=args,
         )
-    else:
-        tests = {
-            "result_valid": False,
-            "test_ok": False,
-            "result": None,
-            "error": "candidate build failed; suite not run",
-            "exit_code": None,
-        }
-    score = score_run(
-        tests,
-        build,
-        manifest=manifest,
-        result_valid=tests.get("result_valid", False),
+        final_score = score_run(
+            final_tests,
+            row["build"],
+            manifest=manifest,
+            result_valid=final_tests.get("result_valid", False),
+        )
+        if row.get("integrity", {}).get("problems"):
+            final_score["eligible"] = False
+            final_score["score"] = 0.0
+            final_score["gate_ok"] = False
+            final_score["perf_valid"] = False
+        row["final"] = {"tests": final_tests, "score": final_score}
+        print(
+            f"  final grade round {row['round']}: "
+            f"score {final_score['score']:.1f}, "
+            f"gates {'pass' if final_score['gate_ok'] else 'FAIL'}, "
+            f"decode x{final_score['decode_speedup']:.3f}, "
+            f"encode x{final_score['encode_speedup']:.3f}"
+        )
+        if final_score["eligible"] and (
+            best is None or final_score["score"] > best["final"]["score"]["score"]
+        ):
+            best = row
+
+    if best is None:
+        best = max(
+            rounds,
+            key=lambda row: float((row.get("final") or {}).get("score", {}).get("score") or row["score"]["score"]),
+        )
+    chosen_final = (best.get("final") or {}).get("score") or best.get("score") or {}
+    chosen_tests = (best.get("final") or {}).get("tests") or best.get("tests") or {}
+    chosen_build = best.get("build") or {}
+    chosen_dir = Path(best["dir"])
+    chosen_metrics = best.get("metrics") or {}
+
+    metrics = aggregate_agent_metrics(rounds)
+    metrics["compactions"] = count_compactions(data_dir)
+    metrics["self_test_runs"] = sum(int(row.get("metrics", {}).get("self_test_runs") or 0) for row in rounds)
+    metrics["max_request_tokens"] = max(
+        int(row.get("metrics", {}).get("max_request_tokens") or 0) for row in rounds
     )
-    if integrity["problems"]:
-        score["eligible"] = False
-        score["score"] = 0.0
-        score["gate_ok"] = False
+    metrics["mean_request_tokens"] = sum(
+        float(row.get("metrics", {}).get("mean_request_tokens") or 0) for row in rounds
+    ) / len(rounds)
+    metrics["gen_tokens_per_s"] = (
+        (metrics["output_tokens"] + metrics["reasoning_tokens"]) / metrics["model_time_s"]
+        if metrics["model_time_s"] > 0
+        else None
+    )
+    metrics["metrics_source"] = "round-logs"
+
+    final_environment = (chosen_tests.get("result") or {}).get("environment") or {}
+    final_score = chosen_final
+    final_build = {
+        "build_ok": bool(chosen_build.get("build_ok")),
+        "seed_build_ok": bool(chosen_build.get("seed_build_ok")),
+        "typecheck_ok": bool(chosen_build.get("typecheck_ok")),
+        "binary": bool(chosen_build.get("binary")),
+    }
+    summaries = [round_summary(row) for row in rounds]
     meta = {
         "run_id": run_id,
         "timestamp": timestamp,
@@ -1565,64 +2191,83 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "thinking": thinking,
         "reasoning_effort": effort,
         "suite_version": manifest.get("suite_version"),
-        "fixture_seed": fixture_seed,
+        "fixture_seed": final_seed,
+        "validation_seed": validation_seed,
+        "final_seed": final_seed,
         "image": args.test_image,
+        "cpu_set": "none" if args.no_cpu_set else str(args.cpu_set),
+        "cpu_count": int(final_environment.get("affinity") or effective_cpu_count()),
+        "network_policy": args.network_policy,
+        "rounds": summaries,
+        "rounds_count": len(rounds),
+        "round_plan": args.round_plan if not args.no_rounds else "single",
+        "best_round": best.get("round"),
+        "confidence": "single-run",
         "budget_wall_cap_s": args.timeout,
         "budget_idle_timeout_s": args.idle_timeout,
-        "wall_s": agent["wall_s"],
-        "compactions": count_compactions(data_dir),
-        "watchdog": agent["watchdog"],
-        "completion": agent["completion"],
-        "outcome": outcome,
-        "steps": steps,
+        "wall_s": metrics["span_s"],
+        "compactions": metrics["compactions"],
+        "watchdog": rounds[-1].get("watchdog"),
+        "round_watchdogs": [row.get("watchdog") for row in rounds],
+        "completion": rounds[-1].get("completion", False),
+        "outcome": classify_outcome(
+            watchdog=str(rounds[-1].get("watchdog") or "exit"),
+            completion=bool(rounds[-1].get("completion")),
+            files_changed=count_changed_files(workdir),
+            agent_ok=bool(rounds[-1].get("agent_ok")),
+        ),
+        "steps": sum(int(row.get("steps") or 0) for row in rounds),
         **metrics,
-        "files_changed": files_changed,
-        "agent_ok": agent["agent_ok"],
-        "agent_exit_code": agent["agent_exit_code"],
-        "self_test_runs": max(metrics.get("self_test_runs") or 0, agent["self_test_runs"]),
-        "build_ok": build["build_ok"],
-        "seed_build_ok": build.get("seed_build_ok", False),
-        "typecheck_ok": build.get("typecheck_ok", False),
-        "test_ok": tests["test_ok"],
-        "test_error": tests["error"],
-        "result_valid": score["result_valid"],
-        "gate_ok": score["gate_ok"],
-        "perf_valid": score["perf_valid"],
-        "eligible": score["eligible"],
-        "score": score["score"],
-        "quality": score["quality"],
-        "decode_speedup": score["decode_speedup"],
-        "encode_speedup": score["encode_speedup"],
-        "target_decode": score["target_decode"],
-        "target_encode": score["target_encode"],
-        "fatal": score["fatal"],
-        "major": score["major"],
-        "minor": score["minor"],
-        "regressions": score["regressions"],
-        "subcases": score["subcases"],
-        "gates": score["gates"],
-        "decode": score["decode"],
-        "encode": score["encode"],
-        "integrity": integrity,
+        "files_changed": count_changed_files(workdir),
+        "agent_ok": bool(rounds[-1].get("agent_ok")),
+        "agent_exit_code": rounds[-1].get("agent_exit_code"),
+        "build_ok": bool(final_build.get("build_ok")),
+        "seed_build_ok": bool(final_build.get("seed_build_ok")),
+        "typecheck_ok": bool(final_build.get("typecheck_ok")),
+        "test_ok": bool(chosen_tests.get("test_ok")),
+        "test_error": chosen_tests.get("error"),
+        "result_valid": bool(final_score.get("result_valid")),
+        "gate_ok": bool(final_score.get("gate_ok")),
+        "perf_valid": bool(final_score.get("perf_valid")),
+        "eligible": bool(final_score.get("eligible")),
+        "score": float(final_score.get("score") or 0.0),
+        "quality": float(final_score.get("quality") or 0.0),
+        "decode_speedup": float(final_score.get("decode_speedup") or 0.0),
+        "encode_speedup": float(final_score.get("encode_speedup") or 0.0),
+        "target_decode": float(final_score.get("target_decode") or 0.0),
+        "target_encode": float(final_score.get("target_encode") or 0.0),
+        "fatal": int(final_score.get("fatal") or 0),
+        "major": int(final_score.get("major") or 0),
+        "minor": int(final_score.get("minor") or 0),
+        "regressions": int(final_score.get("regressions") or 0),
+        "subcases": final_score.get("subcases"),
+        "gates": final_score.get("gates"),
+        "decode": final_score.get("decode"),
+        "encode": final_score.get("encode"),
+        "integrity": rounds[-1].get("integrity"),
         "candidate_rss_bytes": manifest["limits"].get("candidate_rss_bytes"),
         "report": str(run_dir / "report.md"),
-        "agent_log": str(run_dir / "agent.log"),
-        "build_log": str(run_dir / "build-run.log"),
-        "test_log": str(run_dir / "test.log"),
+        "agent_log": str(rounds[0].get("agent_log") or (run_dir / "agent-round-1.log")),
+        "agent_logs": [str(row.get("agent_log") or (run_dir / f"agent-round-{row['round']}.log")) for row in rounds],
+        "build_log": str(chosen_dir / "artifacts" / ".." / "build-run.log"),
+        "test_log": str(chosen_dir / "final" / "test.log"),
     }
-    meta["decode_seed_mp_s"] = _mean_metric(score["decode"], "seed_mp_s")
-    meta["decode_candidate_mp_s"] = _mean_metric(score["decode"], "candidate_mp_s")
-    meta["encode_seed_mp_s"] = _mean_metric(score["encode"], "seed_mp_s")
-    meta["encode_candidate_mp_s"] = _mean_metric(score["encode"], "candidate_mp_s")
+    meta["agent_log"] = str(run_dir / "agent-round-1.log")
+    meta["build_log"] = str(chosen_dir / "build-run.log")
+    meta["test_log"] = str(chosen_dir / "final" / "test.log")
+    meta["decode_seed_mp_s"] = _mean_metric(final_score.get("decode") or [], "seed_mp_s")
+    meta["decode_candidate_mp_s"] = _mean_metric(final_score.get("decode") or [], "candidate_mp_s")
+    meta["encode_seed_mp_s"] = _mean_metric(final_score.get("encode") or [], "seed_mp_s")
+    meta["encode_candidate_mp_s"] = _mean_metric(final_score.get("encode") or [], "candidate_mp_s")
 
-    write_run_report(run_dir, meta, score)
+    write_run_report(run_dir, meta, final_score)
     (run_dir / "score.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    append_result(meta | {"report": str(run_dir / "report.md")})
+    append_result(meta)
     try:
         write_leaderboard()
     except Exception as exc:  # noqa: BLE001
         eprint(f"warning: could not update leaderboard: {exc}")
-    print_summary(meta, score)
+    print_summary(meta, final_score)
     return meta
 
 
@@ -1719,6 +2364,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append("missing seed vendor/")
     if not (SEED_DIR / "crates" / "htj2k-cli" / "src" / "main.rs").exists():
         problems.append("missing seed CLI")
+    if not (SEED_DIR / "corpus" / "public" / "manifest.json").exists():
+        problems.append("missing public fixtures")
     if not (TESTS_DIR / "runner.py").exists():
         problems.append("missing hidden runner")
     if not (TESTS_DIR / "manifest.json").exists():
@@ -1756,7 +2403,16 @@ def cmd_check(args: argparse.Namespace) -> int:
     seed_scan = integrity_scan(SEED_DIR)
     problems.extend(seed_scan["problems"])
     prompt = PROMPT_PATH.read_text(encoding="utf-8") if PROMPT_PATH.exists() else ""
-    for needle in ("4 hours", "single-component", "lossless", "OpenJPH", "COMPLETION.md"):
+    for needle in (
+        "4 hours",
+        "single-component",
+        "lossless",
+        "OpenJPH",
+        "COMPLETION.md",
+        "one CPU",
+        "checkpoint",
+        "ROUND",
+    ):
         if needle.lower() not in prompt.lower():
             problems.append(f"PROMPT.md is missing {needle!r}")
     if not args.no_docker:
@@ -1768,11 +2424,39 @@ def cmd_check(args: argparse.Namespace) -> int:
             if not image_exists(args.engine, args.test_image):
                 problems.append(f"missing image {args.test_image}; run ./bench.py build")
             else:
+                if not args.no_cpu_set:
+                    for image, label in (
+                        (args.test_image, "test"),
+                        (args.agent_image, "agent"),
+                    ):
+                        probe = subprocess.run(
+                            [
+                                args.engine,
+                                "run",
+                                "--rm",
+                                *cpu_set_flags(args),
+                                image,
+                                "bash",
+                                "-c",
+                                "test \"$(nproc)\" -eq 1 && "
+                                "python3 -c 'import os,sys; sys.exit(0 if len(os.sched_getaffinity(0)) == 1 else 1)'",
+                            ],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        if probe.returncode != 0:
+                            problems.append(
+                                f"{label} image is not pinned to one CPU with --cpuset-cpus {args.cpu_set}; "
+                                "the engine may not support cpuset"
+                            )
+                else:
+                    print("warning: --no-cpu-set is for debugging only; official runs require one pinned CPU")
                 probe = subprocess.run(
                     [
                         args.engine,
                         "run",
                         "--rm",
+                        *cpu_set_flags(args),
                         args.test_image,
                         "bash",
                         "-c",
@@ -1789,6 +2473,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                         args.engine,
                         "run",
                         "--rm",
+                        *cpu_set_flags(args),
                         args.agent_image,
                         "bash",
                         "-c",
@@ -1818,6 +2503,10 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"  suite {manifest['suite_version']} · seed {manifest['seed']} · "
             f"{gates} gate subcases · targets "
             f"decode x{manifest['targets']['decode']} / encode x{manifest['targets']['encode']}"
+        )
+        print(
+            f"  cpu-set {args.cpu_set if not args.no_cpu_set else 'unpinned'} · "
+            f"agent network {args.network_policy} · grader network none"
         )
     return 0
 
@@ -1867,15 +2556,30 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not rows:
         print("no runs")
         return 0
-    print(f"{'model':40s} {'score':>6s} {'decode':>8s} {'encode':>8s} {'wall':>7s} {'tokens':>8s}")
-    for row in rows[-args.limit :]:
+    if not args.aggregate:
+        print(f"{'model':40s} {'score':>6s} {'decode':>8s} {'encode':>8s} {'wall':>7s} {'tokens':>8s}")
+        for row in rows[-args.limit :]:
+            print(
+                f"{row.get('model', '?'):40s} "
+                f"{score_row(row):6.1f} "
+                f"{_fmt(row.get('decode_speedup'), 3):>8} "
+                f"{_fmt(row.get('encode_speedup'), 3):>8} "
+                f"{format_duration(row.get('wall_s')):>7s} "
+                f"{format_tokens(row.get('total_tokens')):>8s}"
+            )
+        print("")
+    print("models:")
+    print(
+        f"{'model':40s} {'variant':10s} {'runs':>4s} {'median':>7s} "
+        f"{'best':>6s} {'gate':>5s} {'decode':>7s} {'encode':>7s} {'conf':>11s}"
+    )
+    for entry in aggregate_entries(rows):
         print(
-            f"{row.get('model', '?'):40s} "
-            f"{score_row(row):6.1f} "
-            f"{_fmt(row.get('decode_speedup'), 3):>8} "
-            f"{_fmt(row.get('encode_speedup'), 3):>8} "
-            f"{format_duration(row.get('wall_s')):>7s} "
-            f"{format_tokens(row.get('total_tokens')):>8s}"
+            f"{entry['model']:40s} {entry['variant']:10s} {entry['runs']:4d} "
+            f"{entry['median_score']:7.1f} {entry['best_score']:6.1f} "
+            f"{entry['gate_rate'] * 100:4.0f}% "
+            f"{_fmt(entry['median_decode'], 3):>7s} {_fmt(entry['median_encode'], 3):>7s} "
+            f"{entry['confidence']:>11s}"
         )
     return 0
 
@@ -1940,12 +2644,14 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     meta = json.loads(meta_path.read_text())
     workdir = run_dir / "workdir"
     manifest = load_manifest()
+    rescore_dir = run_dir / "rescore"
     build = build_app(
         run_dir,
         workdir,
         engine=args.engine,
         image=args.test_image,
         dry_run=args.dry_run,
+        artifacts_dir=rescore_dir,
     )
     tests = run_tests(
         run_dir,
@@ -1953,7 +2659,10 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         image=args.test_image,
         dry_run=args.dry_run,
         manifest=manifest,
-        fixture_seed=int(meta.get("fixture_seed") or manifest["seed"]),
+        fixture_seed=int(meta.get("final_seed") or meta.get("fixture_seed") or manifest["seed"]),
+        artifacts_dir=rescore_dir,
+        require_single_cpu=not args.no_cpu_set,
+        args=args,
     )
     score = score_run(
         tests,
@@ -1979,8 +2688,12 @@ def cmd_rescore(args: argparse.Namespace) -> int:
             "encode": score["encode"],
             "test_ok": tests["test_ok"],
             "test_error": tests["error"],
+            "cpu_set": "none" if args.no_cpu_set else str(args.cpu_set),
+            "network_policy": args.network_policy,
         }
     )
+    meta["test_log"] = str(rescore_dir / "test.log")
+    meta["build_log"] = str(rescore_dir / "build-run.log")
     write_run_report(run_dir, meta, score)
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     append_result(meta)
@@ -1995,13 +2708,25 @@ def cmd_preview(args: argparse.Namespace) -> int:
         eprint("error: preview needs RUN_ID")
         return 2
     run_dir = RUNS_DIR / run_id
-    binary = run_dir / "artifacts" / "bin" / "candidate"
-    if not binary.exists():
+    meta_path = run_dir / "score.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+    candidates = []
+    best_round = meta.get("best_round")
+    if best_round:
+        candidates.append(run_dir / "rounds" / f"round-{best_round}" / "artifacts" / "bin" / "candidate")
+    candidates.append(run_dir / "artifacts" / "bin" / "candidate")
+    candidates.append(run_dir / "rescore" / "bin" / "candidate")
+    binary = next((path for path in candidates if path.exists()), None)
+    if binary is None:
         eprint(f"error: no built candidate in {run_dir}")
         return 2
     print(f"candidate binary: {binary}")
     print(f"report: {run_dir / 'report.md'}")
-    print(f"results: {run_dir / 'artifacts' / 'results.json'}")
+    if best_round:
+        print(f"results: {run_dir / 'rounds' / f'round-{best_round}' / 'final' / 'results.json'}")
+        print(f"rounds: {run_dir / 'rounds'}")
+    else:
+        print(f"results: {run_dir / 'artifacts' / 'results.json'}")
     return 0
 
 
@@ -2012,11 +2737,39 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         run_dir = RUNS_DIR / str(row.get("run_id"))
         if not run_dir.exists():
             continue
-        log = run_dir / "agent.log"
-        if not log.exists():
+        logs = sorted(run_dir.glob("agent-round-*.log"))
+        if not logs:
+            legacy = run_dir / "agent.log"
+            logs = [legacy] if legacy.exists() else []
+        if not logs:
             continue
-        metrics = read_agent_usage(log, _float(row.get("wall_s")) or 0.0)
-        for key, value in metrics.items():
+        total_wall = _float(row.get("wall_s")) or 0.0
+        per_log = total_wall / len(logs) if total_wall else 0.0
+        merged: dict[str, float] = {}
+        max_request = 0
+        for log in logs:
+            metrics = read_agent_usage(log, per_log)
+            max_request = max(max_request, int(metrics.get("max_request_tokens") or 0))
+            for key, value in metrics.items():
+                if isinstance(value, (int, float)) and key not in {
+                    "max_request_tokens",
+                    "mean_request_tokens",
+                    "gen_tokens_per_s",
+                    "metrics_version",
+                }:
+                    merged[key] = merged.get(key, 0.0) + float(value)
+        merged["max_request_tokens"] = max_request
+        if logs:
+            means = [
+                float((read_agent_usage(log, per_log)).get("mean_request_tokens") or 0)
+                for log in logs
+            ]
+            merged["mean_request_tokens"] = sum(means) / len(means)
+        if merged.get("model_time_s"):
+            merged["gen_tokens_per_s"] = (
+                merged.get("output_tokens", 0.0) + merged.get("reasoning_tokens", 0.0)
+            ) / merged["model_time_s"]
+        for key, value in merged.items():
             if key in CSV_FIELDS and row.get(key) in (None, ""):
                 row[key] = value
                 changed += 1
@@ -2039,6 +2792,18 @@ def submission_from_score(meta: dict) -> dict:
         "reasoning_effort": meta.get("reasoning_effort"),
         "suite_version": meta.get("suite_version"),
         "fixture_seed": meta.get("fixture_seed"),
+        "validation_seed": meta.get("validation_seed"),
+        "final_seed": meta.get("final_seed") or meta.get("fixture_seed"),
+        "cpu_set": meta.get("cpu_set"),
+        "cpu_count": meta.get("cpu_count"),
+        "network_policy": meta.get("network_policy"),
+        "rounds": [
+            {key: value for key, value in row.items() if key not in {"artifacts", "source"}}
+            for row in (meta.get("rounds") or [])
+        ],
+        "rounds_count": meta.get("rounds_count"),
+        "best_round": meta.get("best_round"),
+        "confidence": meta.get("confidence"),
         "score": round(float(meta.get("score") or 0.0), 2),
         "eligible": bool(meta.get("eligible")),
         "gate_ok": bool(meta.get("gate_ok")),
@@ -2075,6 +2840,8 @@ def validate_submission(data: object) -> list[str]:
             problems.append(f"missing {key}")
     if data.get("suite_version") != SUITE_VERSION:
         problems.append(f"suite_version must be {SUITE_VERSION!r}")
+    if data.get("network_policy") not in (None, "open", "offline"):
+        problems.append("network_policy must be 'open' or 'offline'")
     try:
         score = float(data.get("score") or 0)
     except (TypeError, ValueError):
@@ -2183,6 +2950,11 @@ def cmd_site(args: argparse.Namespace) -> int:
                     "decode_speedup": row.get("decode_speedup"),
                     "encode_speedup": row.get("encode_speedup"),
                     "eligible": row.get("eligible"),
+                    "gate_ok": row.get("gate_ok"),
+                    "perf_valid": row.get("perf_valid"),
+                    "network_policy": row.get("network_policy"),
+                    "cpu_set": row.get("cpu_set"),
+                    "confidence": row.get("confidence"),
                     "hardware": row.get("hardware"),
                     "wall_s": row.get("wall_s"),
                     "total_tokens": row.get("total_tokens"),
@@ -2206,6 +2978,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-image", default=DEFAULT_AGENT_IMAGE)
     parser.add_argument("--test-image", default=DEFAULT_TEST_IMAGE)
     parser.add_argument("--config", help="OpenCode config directory or file")
+    parser.add_argument("--cpu-set", default=DEFAULT_CPU_SET,
+                        help="CPU affinity set for agent and grader (default: 0)")
+    parser.add_argument("--no-cpu-set", action="store_true",
+                        help="disable CPU pinning (debugging only)")
+    parser.add_argument("--network-policy", default=DEFAULT_NETWORK_POLICY,
+                        choices=("open", "offline"),
+                        help="agent network policy label; grading is always offline")
     parser.add_argument("--dry-run", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -2228,6 +3007,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reps", type=int, default=1)
     p.add_argument("--timeout", type=int, default=4 * 3600)
     p.add_argument("--idle-timeout", type=int, default=3600)
+    p.add_argument("--round-plan", default="75,75,45",
+                   help="comma-separated per-round minutes; last round is finalize")
+    p.add_argument("--no-rounds", action="store_true",
+                   help="single agent run using --timeout instead of checkpoints")
     p.add_argument("--fixture-seed", type=int)
     p.add_argument("--agent")
     p.add_argument("--agent-cmd", help="override the agent command (test/debug)")
@@ -2245,6 +3028,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("report", help="print a score table")
     p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--aggregate", action="store_true", help="show model summary only")
     p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("leaderboard", help="write and serve the leaderboard")

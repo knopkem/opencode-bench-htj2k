@@ -1,0 +1,61 @@
+{
+  "schema": "opencode-bench/htj2k-public-fixtures@1",
+  "cases": [
+    {
+      "id": "public-gray-8-256-d5-64-lrcp",
+      "width": 256,
+      "height": 256,
+      "bit_depth": 8,
+      "decompositions": 5,
+      "block_size": "64x64",
+      "progression": "LRCP",
+      "raw": "public-gray-8-256-d5-64-lrcp.raw",
+      "j2c": "public-gray-8-256-d5-64-lrcp.j2c"
+    },
+    {
+      "id": "public-gray-12-256-d5-4x1024-lrcp",
+      "width": 256,
+      "height": 256,
+      "bit_depth": 12,
+      "decompositions": 5,
+      "block_size": "4x1024",
+      "progression": "LRCP",
+      "raw": "public-gray-12-256-d5-4x1024-lrcp.raw",
+      "j2c": "public-gray-12-256-d5-4x1024-lrcp.j2c"
+    },
+    {
+      "id": "public-gray-16-256-d3-16x16-lrcp",
+      "width": 256,
+      "height": 256,
+      "bit_depth": 16,
+      "decompositions": 3,
+      "block_size": "16x16",
+      "progression": "LRCP",
+      "raw": "public-gray-16-256-d3-16x16-lrcp.raw",
+      "j2c": "public-gray-16-256-d3-16x16-lrcp.j2c"
+    },
+    {
+      "id": "public-gray-12-256-d4-64-rpcl",
+      "width": 256,
+      "height": 256,
+      "bit_depth": 12,
+      "decompositions": 4,
+      "block_size": "64x64",
+      "progression": "RPCL",
+      "raw": "public-gray-12-256-d4-64-rpcl.raw",
+      "j2c": "public-gray-12-256-d4-64-rpcl.j2c"
+    },
+    {
+      "id": "public-gray-12-256-d5-4x1024-tiled",
+      "width": 256,
+      "height": 256,
+      "bit_depth": 12,
+      "decompositions": 5,
+      "block_size": "4x1024",
+      "progression": "LRCP",
+      "tile_size": "128x128",
+      "raw": "public-gray-12-256-d5-4x1024-tiled.raw",
+      "j2c": "public-gray-12-256-d5-4x1024-tiled.j2c"
+    }
+  ]
+}
