@@ -1,0 +1,142 @@
+# opencode-bench-htj2k
+
+A local-LLM benchmark where the model optimises a **working pure-Rust HTJ2K
+codec** for lossless encode and decode throughput.
+
+HTJ2K (JPEG 2000 Part 15) is the high-throughput block-coding mode used by
+DICOM transfer syntax `1.2.840.10008.1.2.4.201`. The seed is a pure-Rust port of
+[OpenJPH](https://github.com/aous72/OpenJPH). It is correct, but there is
+substantial headroom in the entropy coder, wavelet transform and allocation
+paths. The model gets the seed and four hours; the hidden suite measures the
+result.
+
+This repository is a Docker-only fork of
+[`opencode-bench-plusplus`](https://github.com/knopkem/opencode-bench-plusplus)
+with the codec-optimisation framing inspired by
+[`codec-reverse-bench`](https://github.com/andreasknopke/codec-reverse-bench).
+There is no host sandbox: the agent, build and grading steps all run in
+containers.
+
+## Quick start
+
+```bash
+./bench.py build                 # build agent and test images
+./bench.py check                 # prompt, seed, manifest, images
+./bench.py models                # local OpenCode providers/models
+./bench.py run --model provider/model
+./bench.py run --model provider/model --variant high
+./bench.py status
+./bench.py report
+./bench.py leaderboard           # serve + open the local page
+./bench.py rescore --run RUN_ID
+./bench.py submit --run RUN_ID --print
+python3 -m unittest discover -s tests
+```
+
+Docker/OrbStack must be running (`docker info`). The harness reads the local
+OpenCode configuration; there is no model list or credential in this repo.
+
+## What the model does
+
+Each run copies `tasks/htj2k/seed/` into a fresh workdir and adds
+`tasks/htj2k/PROMPT.md` as `PROMPT.md`. The seed builds and passes every
+correctness gate. The model must keep the CLI and codestream contract while
+making decode and encode faster.
+
+The hidden suite is mounted only after the agent exits. The test container has
+no network, runs on one CPU, and executes the candidate as an unprivileged user.
+The independent C++ OpenJPH oracle lives in a mode-700 directory that the
+candidate cannot read.
+
+## Grading
+
+Correctness is a gate:
+
+- lossless decode bit-exact against C++ OpenJPH;
+- lossless encode decodes bit-exactly with C++ OpenJPH and stays within 2% + 1
+  KiB of the oracle's compressed size;
+- real DICOM `.201` codestream decode;
+- malformed-input handling and determinism.
+
+Performance is seed-normalised:
+
+```text
+decode_speedup = geomean(seed_time / candidate_time)
+encode_speedup = geomean(seed_time / candidate_time)
+
+noise  = 0.05   # measurement noise floor
+credit = clamp((speedup - 1 - noise) / (target - 1 - noise), 0, 2)
+score  = 100 * (0.5 * credit_decode + 0.5 * credit_encode)
+```
+
+The untouched seed scores `0`. Matching the frozen target in both dimensions
+scores `100`; targets are derived from the seed/OpenJPH ratios on the reference
+machine with a 1.25x floor. Correctness failure means ineligible and `0`.
+
+The frozen catalog is `tasks/htj2k/tests/manifest.json`: suite `htj2k-v1`,
+per-run fixture seed, ten encode+decode cases, five decode-only layouts, a DICOM
+`.201` fixture, malformed-input checks and four decode plus four encode
+throughput workloads.
+
+## Frozen limits
+
+| Limit | Value |
+|---|---:|
+| Agent wall clock | 4 h |
+| Agent idle timeout | 1 h |
+| Candidate memory cap | 2 GiB |
+| File deadline | 120 s |
+| Perf suite deadline | 15 min |
+| Perf repetitions | 7 |
+| Perf CPU budget | 1 CPU |
+| Encode size slack | 2% + 1 KiB |
+
+## Test families
+
+| Family | Purpose |
+|---|---|
+| `p0.decode-lossless` | bit-exact decode across bit depths, block sizes, progression orders and tiles |
+| `p0.encode-lossless` | oracle-decodable output, size gate |
+| `p0.dicom-201` | real DICOM `.201` codestream |
+| `p0.robustness` | truncated, garbage, empty and wrong-sized inputs fail cleanly |
+| `p0.determinism` | repeated encode output is identical |
+
+Performance families are `decode` and `encode`, each with four generated
+workloads. They are continuous, not pass/fail.
+
+## Repository map
+
+```text
+bench.py                       harness, Docker orchestration, scoring, leaderboard
+docker/agent.Dockerfile        Ubuntu + Rust + OpenCode (no oracle)
+docker/test.Dockerfile         Ubuntu + Rust + Python + pinned C++ OpenJPH oracle
+tasks/htj2k/PROMPT.md          candidate-visible contract
+tasks/htj2k/seed/              candidate-visible codec, CLI and public benchmark
+tasks/htj2k/tests/             hidden suite, manifest, corpus and oracle
+tasks/htj2k/CALIBRATION.md     reference measurements and target derivation
+submissions/                   community submission schema and example
+tests/test_bench.py            harness/scoring unit tests
+```
+
+## Hidden-suite validation
+
+The seed must pass all gates and score `0.0` with no changes. The independent
+oracle must decode every fixture. Negative controls and repeated runs are
+maintainer release gates; see `AGENTS.md`.
+
+## Trust model
+
+The agent container has network access for the model provider. A model could look
+up OpenJPH source online; the seed is already a port of it, so the gain is
+limited, but this is **capability evidence, not a security boundary**. The
+hidden corpus is regenerated per run and expected pixels never enter the
+candidate process. Community submissions are self-reported unless a maintainer
+adds `verified`.
+
+## License and attribution
+
+The codec seed is derived from OpenJPH-RS, a BSD-2-Clause pure-Rust port of
+OpenJPH v0.26.3. The oracle is built from the pinned OpenJPH source under
+`tasks/htj2k/tests/oracle/OpenJPH` (BSD-2-Clause). See the notices in
+`tasks/htj2k/seed/crates/htj2k/NOTICE` and
+`tasks/htj2k/tests/oracle/OpenJPH/LICENSE`.

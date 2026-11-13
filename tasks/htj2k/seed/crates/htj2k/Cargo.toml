@@ -1,0 +1,20 @@
+[package]
+name = "htj2k"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+description = "HTJ2K (JPEG 2000 Part 15) codec — benchmark seed"
+license = "BSD-2-Clause"
+repository = "https://github.com/knopkem/opencode-bench-htj2k"
+keywords = ["jpeg2000", "htj2k", "dicom", "image", "codec"]
+categories = ["multimedia::images", "encoding"]
+
+[lib]
+name = "htj2k"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+
+[features]
+default = []

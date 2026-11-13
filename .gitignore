@@ -1,0 +1,15 @@
+runs/
+*.csv
+*.csv.lock
+*.html
+docs/
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+
+# Rust build artifacts in the seed and workdirs
+tasks/htj2k/seed/target/
+tasks/htj2k/seed/corpus/generated/
+
+tasks/htj2k/tests/oracle/OpenJPH/build/

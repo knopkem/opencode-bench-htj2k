@@ -1,0 +1,15 @@
+This crate is a fork of openjph-core, a pure-Rust port of OpenJPH v0.26.3.
+It is used as the benchmark seed and the port is attributed as follows.
+
+OpenJPH
+Copyright (c) 2019, Aous Naman
+Copyright (c) 2019, Kakadu Software Pty Ltd, Australia
+Copyright (c) 2019, The University of New South Wales, Sydney, Australia
+
+openjph-core (Rust port)
+Copyright (c) the openjph-core contributors
+
+The benchmark-specific CLI wrapper and harness are original work for
+opencode-bench-htj2k.
+
+Licensed under the BSD 2-Clause License. See LICENSE.

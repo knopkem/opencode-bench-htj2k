@@ -1,0 +1,45 @@
+name: Benchmark result
+description: Submit an opencode-bench-htj2k result
+title: "[result] <model> · score <score> · <run id>"
+labels: ["benchmark-result"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use `./bench.py submit --run RUN_ID --print` and paste the JSON block.
+        Results are self-reported unless a maintainer adds `verified`.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Exact OpenCode model reference
+      placeholder: provider/model
+    validations:
+      required: true
+  - type: input
+    id: variant
+    attributes:
+      label: Variant / reasoning effort
+      placeholder: high
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      placeholder: Apple M3 Pro, 36 GB, Docker Desktop
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Result JSON
+      description: Paste the fenced JSON block printed by `./bench.py submit`.
+      render: json
+    validations:
+      required: true
+  - type: checkboxes
+    id: attest
+    attributes:
+      label: Attestation
+      options:
+        - label: The result was produced by the unmodified harness and the score fields were not edited.
+          required: true

@@ -1,0 +1,5 @@
+opencode-bench-htj2k seed
+
+The codec library under crates/htj2k is derived from openjph-core, a pure-Rust
+port of OpenJPH v0.26.3 (BSD-2-Clause). See crates/htj2k/NOTICE and LICENSE.
+The CLI wrapper under crates/htj2k-cli is original benchmark code.

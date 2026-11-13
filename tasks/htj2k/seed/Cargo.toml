@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/htj2k", "crates/htj2k-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "BSD-2-Clause"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
