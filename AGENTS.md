@@ -97,3 +97,7 @@ Requirements:
   grader exposes one CPU; check `nproc` before trusting an A/B number.
 - Network is labelled `open` for cloud models. Do not mix open-network and
   offline results in the same ranking.
+- Provider quota/rate-limit errors are not model failures. Stop at the first
+  `provider.*`/429/5xx error, keep the checkpoint, mark the run `agent_error`
+  and ineligible, and never submit it. Do not spend later rounds on a dead
+  provider.

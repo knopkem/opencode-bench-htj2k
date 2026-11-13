@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -228,6 +229,40 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("/work/ROUND-2.md", command)
         command = bench.agent_command(args, round_number=2, continue_session=True)
         self.assertIn("--continue", command)
+
+    def test_provider_error_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = bench.Path(directory) / "agent.log"
+            path.write_text(
+                json.dumps(
+                    {
+                        "type": "error",
+                        "error": {
+                            "type": "provider.free-limit",
+                            "status": 429,
+                            "message": "Free usage limit reached",
+                        },
+                        "retryAfterMs": 23958000,
+                    }
+                )
+                + "\n"
+            )
+            error = bench.parse_provider_error(path)
+            self.assertIsNotNone(error)
+            self.assertEqual(error["type"], "provider.free-limit")
+            self.assertEqual(error["status"], 429)
+
+    def test_aggregate_skips_agent_error(self) -> None:
+        row = {
+            "run_id": "bad",
+            "model": "m",
+            "variant": "default",
+            "score": "0",
+            "eligible": "false",
+            "outcome": "agent-error",
+            "agent_error": '{"type":"provider.free-limit"}',
+        }
+        self.assertEqual(bench.aggregate_entries([row]), [])
 
     def test_aggregate_single_and_multi_run(self) -> None:
         row = {

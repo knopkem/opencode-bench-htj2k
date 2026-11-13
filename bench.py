@@ -179,6 +179,8 @@ CSV_FIELDS = [
     "validation_seed",
     "final_seed",
     "confidence",
+    "agent_error",
+    "provider_retry_after_s",
     "budget_wall_cap_s",
     "budget_idle_timeout_s",
     "build_ok",
@@ -567,6 +569,47 @@ def agent_command(
     return " ".join(parts)
 
 
+def parse_provider_error(log_path: Path) -> dict | None:
+    """Find a provider/API failure in an OpenCode JSON log.
+
+    OpenCode can exit 0 even when the provider rejects a request. The error
+    event is the reliable signal; a run aborted by quota/rate limit is not a
+    model result.
+    """
+    if not log_path.exists():
+        return None
+    found: dict | None = None
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") != "error":
+            continue
+        error = event.get("error") or {}
+        if not isinstance(error, dict):
+            error = {"message": str(error)}
+        kind = str(error.get("type") or "")
+        status = error.get("status")
+        message = str(error.get("message") or "")
+        if (
+            kind.startswith("provider.")
+            or kind in {"rate_limit", "free_limit", "provider"}
+            or status in {429, 500, 502, 503, 504}
+            or "usage limit" in message.lower()
+        ):
+            found = {
+                "type": kind or "provider",
+                "status": status,
+                "message": message[:400],
+                "retry_after_ms": event.get("retryAfterMs"),
+            }
+    return found
+
+
 def start_agent(
     model: str,
     config_dir: Path,
@@ -692,15 +735,17 @@ def start_agent(
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
     self_tests = len(SELF_TEST_RE.findall(log_text))
     session_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', log_text)
+    provider_error = parse_provider_error(log_path)
     return {
         "wall_s": wall_s,
         "watchdog": watchdog,
         "completion": (workdir / "COMPLETION.md").exists(),
-        "agent_ok": proc.returncode == 0,
+        "agent_ok": proc.returncode == 0 and provider_error is None,
         "agent_exit_code": proc.returncode,
         "self_test_runs": self_tests,
         "session_id": session_match.group(1) if session_match else None,
         "log_path": str(log_path),
+        "provider_error": provider_error,
     }
 
 
@@ -1303,6 +1348,20 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- watchdog: {meta['watchdog']}",
         f"- completion file: {meta['completion']}",
         f"- outcome: {meta.get('outcome', 'unknown')}",
+        *(
+            [
+                f"- agent error: {meta['agent_error'].get('type')} "
+                f"({meta['agent_error'].get('status')}): "
+                f"{meta['agent_error'].get('message', '')[:300]}"
+                + (
+                    f" (retry after {meta['provider_retry_after_s']:.0f}s)"
+                    if meta.get("provider_retry_after_s")
+                    else ""
+                )
+            ]
+            if meta.get("agent_error")
+            else []
+        ),
         f"- steps: {meta.get('steps', 0)}",
         f"- files changed: {meta.get('files_changed', 0)}",
         f"- build: {'ok' if meta['build_ok'] else 'failed'}"
@@ -1414,6 +1473,8 @@ def append_result(row: dict) -> None:
     row = dict(row)
     if isinstance(row.get("rounds"), list):
         row["rounds"] = len(row["rounds"])
+    if isinstance(row.get("agent_error"), dict):
+        row["agent_error"] = json.dumps(row["agent_error"], sort_keys=True)
     with results_lock():
         rows = read_result_rows()
         rows = [existing for existing in rows if existing.get("run_id") != row.get("run_id")]
@@ -1477,6 +1538,11 @@ def aggregate_entries(rows: list[dict]) -> list[dict]:
     groups: dict[tuple[str, str], list[dict]] = {}
     for row in rows:
         if not row.get("run_id"):
+            continue
+        if row.get("agent_error") or str(row.get("outcome") or "") in {
+            "agent-error",
+            "provider-error",
+        }:
             continue
         key = (str(row.get("model") or "?"), str(row.get("variant") or "default"))
         groups.setdefault(key, []).append(row)
@@ -1561,7 +1627,12 @@ def render_leaderboard(rows: list[dict]) -> str:
         )
     body = []
     for index, entry in enumerate(entries, 1):
-        status = "eligible" if entry["_eligible"] else "ineligible"
+        status = (
+            "agent-error"
+            if entry.get("agent_error")
+            or str(entry.get("outcome") or "") in {"agent-error", "provider-error"}
+            else ("eligible" if entry["_eligible"] else "ineligible")
+        )
         body.append(
             "<tr>"
             f"<td>{index}</td>"
@@ -1638,6 +1709,17 @@ def print_summary(meta: dict, score: dict) -> None:
         f" ({score['gate_pass']}/{score['gate_total']})"
         f"   perf {'ok' if score['perf_valid'] else 'FAIL'}"
     )
+    if meta.get("agent_error"):
+        print(
+            f"  AGENT ERROR: {meta['agent_error'].get('type')} "
+            f"({meta['agent_error'].get('status')}): "
+            f"{meta['agent_error'].get('message', '')[:180]}"
+            + (
+                f" (retry after {meta['provider_retry_after_s']:.0f}s)"
+                if meta.get("provider_retry_after_s")
+                else ""
+            )
+        )
     print(
         f"  score {score['score']:.1f}"
         f"   decode x{score['decode_speedup']:.3f}"
@@ -1896,6 +1978,7 @@ def round_summary(row: dict) -> dict:
         "wall_s": row.get("wall_s"),
         "watchdog": row.get("watchdog"),
         "completion": row.get("completion"),
+        "provider_error": bool(row.get("provider_error")),
         "build_ok": bool((row.get("build") or {}).get("build_ok")),
         "gate_ok": bool(validation.get("gate_ok")),
         "gate_pass": validation.get("gate_pass", 0),
@@ -2003,6 +2086,12 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             timeout_s=budget_s,
             idle_timeout_s=idle_s,
         )
+        provider_error = agent.get("provider_error")
+        if provider_error:
+            print(
+                f"  provider error: {provider_error.get('type')} "
+                f"({provider_error.get('status')}): {provider_error.get('message', '')[:160]}"
+            )
         session_id = session_id or agent.get("session_id")
         log_path = Path(agent.get("log_path") or (run_dir / f"agent-round-{round_number}.log"))
         metrics = read_agent_usage(log_path, float(agent["wall_s"]))
@@ -2065,6 +2154,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 "agent_ok": bool(agent["agent_ok"]),
                 "agent_exit_code": agent["agent_exit_code"],
                 "session_id": session_id,
+                "provider_error": provider_error,
                 "metrics": metrics,
                 "steps": steps,
                 "integrity": integrity,
@@ -2090,6 +2180,11 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             if archived.exists():
                 archived.unlink()
             completion.replace(archived)
+        if provider_error:
+            # A provider quota/rate-limit error is not a model failure and
+            # cannot be retried inside a 4-hour budget. Keep the checkpoint for
+            # diagnostics, then stop instead of burning later rounds.
+            break
 
     if args.dry_run:
         print("dry run complete; no score or report written")
@@ -2173,8 +2268,18 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     )
     metrics["metrics_source"] = "round-logs"
 
+    provider_errors = [row.get("provider_error") for row in rounds if row.get("provider_error")]
+    agent_error = provider_errors[-1] if provider_errors else None
     final_environment = (chosen_tests.get("result") or {}).get("environment") or {}
-    final_score = chosen_final
+    final_score = dict(chosen_final) if chosen_final else {}
+    if agent_error:
+        final_score["eligible"] = False
+        final_score["score"] = 0.0
+        final_score["quality"] = 0.0
+        for row in rounds:
+            if row.get("final"):
+                row["final"]["score"]["eligible"] = False
+                row["final"]["score"]["score"] = 0.0
     final_build = {
         "build_ok": bool(chosen_build.get("build_ok")),
         "seed_build_ok": bool(chosen_build.get("seed_build_ok")),
@@ -2205,6 +2310,12 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "round_plan": args.round_plan if not args.no_rounds else "single",
         "best_round": best.get("round"),
         "confidence": "single-run",
+        "agent_error": agent_error,
+        "provider_retry_after_s": (
+            float(agent_error.get("retry_after_ms")) / 1000.0
+            if agent_error and agent_error.get("retry_after_ms")
+            else None
+        ),
         "budget_wall_cap_s": args.timeout,
         "budget_idle_timeout_s": args.idle_timeout,
         "wall_s": metrics["span_s"],
@@ -2212,7 +2323,9 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "watchdog": rounds[-1].get("watchdog"),
         "round_watchdogs": [row.get("watchdog") for row in rounds],
         "completion": rounds[-1].get("completion", False),
-        "outcome": classify_outcome(
+        "outcome": "provider-error"
+        if agent_error
+        else classify_outcome(
             watchdog=str(rounds[-1].get("watchdog") or "exit"),
             completion=bool(rounds[-1].get("completion")),
             files_changed=count_changed_files(workdir),
@@ -2221,7 +2334,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "steps": sum(int(row.get("steps") or 0) for row in rounds),
         **metrics,
         "files_changed": count_changed_files(workdir),
-        "agent_ok": bool(rounds[-1].get("agent_ok")),
+        "agent_ok": bool(rounds[-1].get("agent_ok")) and agent_error is None,
         "agent_exit_code": rounds[-1].get("agent_exit_code"),
         "build_ok": bool(final_build.get("build_ok")),
         "seed_build_ok": bool(final_build.get("seed_build_ok")),
@@ -2548,7 +2661,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             f"score {score_row(row):6.1f}  "
             f"decode x{_fmt(row.get('decode_speedup'), 3):>7}  "
             f"encode x{_fmt(row.get('encode_speedup'), 3):>7}  "
-            f"{'eligible' if str(row.get('eligible')).lower() == 'true' else 'ineligible'}"
+            f"{'agent-error' if str(row.get('outcome') or '') in {'agent-error', 'provider-error'} or row.get('agent_error') else ('eligible' if str(row.get('eligible')).lower() == 'true' else 'ineligible')}"
         )
     return 0
 
@@ -2782,6 +2895,11 @@ def cmd_backfill(args: argparse.Namespace) -> int:
 
 
 def submission_from_score(meta: dict) -> dict:
+    outcome = str(meta.get("outcome") or "")
+    agent_error = meta.get("agent_error")
+    if agent_error is None and outcome in {"agent-error", "provider-error"}:
+        agent_error = {"type": "agent-error", "message": outcome}
+    eligible = bool(meta.get("eligible")) and agent_error is None
     return {
         "schema": SUBMISSION_SCHEMA,
         "run_id": meta.get("run_id"),
@@ -2806,8 +2924,10 @@ def submission_from_score(meta: dict) -> dict:
         "rounds_count": meta.get("rounds_count"),
         "best_round": meta.get("best_round"),
         "confidence": meta.get("confidence"),
+        "agent_error": agent_error,
+        "provider_retry_after_s": meta.get("provider_retry_after_s"),
         "score": round(float(meta.get("score") or 0.0), 2),
-        "eligible": bool(meta.get("eligible")),
+        "eligible": eligible,
         "gate_ok": bool(meta.get("gate_ok")),
         "perf_valid": bool(meta.get("perf_valid")),
         "decode_speedup": meta.get("decode_speedup"),
@@ -2844,6 +2964,8 @@ def validate_submission(data: object) -> list[str]:
         problems.append(f"suite_version must be {SUITE_VERSION!r}")
     if data.get("network_policy") not in (None, "open", "offline"):
         problems.append("network_policy must be 'open' or 'offline'")
+    if data.get("agent_error") and data.get("eligible"):
+        problems.append("a run with an agent/provider error cannot be eligible")
     try:
         score = float(data.get("score") or 0)
     except (TypeError, ValueError):
@@ -2883,6 +3005,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
         eprint(f"error: {score_path} missing; run or rescore the run first")
         return 2
     meta = json.loads(score_path.read_text())
+    if (
+        not meta.get("eligible")
+        or meta.get("agent_error")
+        or str(meta.get("outcome") or "") in {"agent-error", "provider-error"}
+    ):
+        eprint("error: refusing to submit an ineligible or agent-error run")
+        return 2
     submission = submission_from_score(meta)
     problems = validate_submission(submission)
     if problems:
@@ -2957,6 +3086,7 @@ def cmd_site(args: argparse.Namespace) -> int:
                     "network_policy": row.get("network_policy"),
                     "cpu_set": row.get("cpu_set"),
                     "confidence": row.get("confidence"),
+                    "agent_error": row.get("agent_error"),
                     "hardware": row.get("hardware"),
                     "wall_s": row.get("wall_s"),
                     "total_tokens": row.get("total_tokens"),

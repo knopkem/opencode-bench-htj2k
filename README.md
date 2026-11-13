@@ -152,6 +152,11 @@ and is low-confidence. Three runs with different seeds are recommended for a
 strong claim. Community submissions are self-reported unless a maintainer adds
 `verified`.
 
+Provider quota/rate-limit errors (`provider.free-limit`, HTTP 429/5xx) are
+detected in the agent log. The harness stops immediately, keeps the checkpoint
+for diagnostics, marks the run `agent_error` and ineligible, and refuses to
+submit it. Such a run is not a model result.
+
 ## License and attribution
 
 The codec seed is derived from OpenJPH-RS, a BSD-2-Clause pure-Rust port of

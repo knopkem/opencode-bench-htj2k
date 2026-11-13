@@ -190,6 +190,18 @@
       "items": {
         "type": "object"
       }
+    },
+    "agent_error": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "provider_retry_after_s": {
+      "type": [
+        "number",
+        "null"
+      ]
     }
   },
   "additionalProperties": true

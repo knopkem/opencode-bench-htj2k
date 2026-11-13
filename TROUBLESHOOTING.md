@@ -47,6 +47,15 @@ from the same session and workdir. The official score is the best eligible
 checkpoint rescored on a held-out final corpus. Look at
 `runs/<id>/rounds/round-N/` and `rounds` in `score.json`.
 
+## The run ended with a provider error
+
+OpenCode can exit 0 even when the provider rejects a request. The harness scans
+the JSON log for `provider.free-limit`, HTTP 429/5xx and usage-limit errors. It
+stops further rounds, keeps the checkpoint for diagnostics, and marks the run
+`agent_error` / ineligible. It will not submit it. `provider_retry_after_s`
+records the provider's cooldown; free-tier limits are often hours long, longer
+than the 4-hour budget. Switch providers or use a paid model.
+
 ## The leaderboard shows a single run
 
 One run is accepted but labelled `single-run`. Run three times with different
