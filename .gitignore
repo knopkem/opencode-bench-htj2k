@@ -8,6 +8,7 @@ __pycache__/
 .venv/
 .DS_Store
 .private-eval/
+.serena/
 
 # Rust build artifacts in the seed and workdirs
 tasks/htj2k/seed/target/
