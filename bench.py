@@ -2132,48 +2132,129 @@ def _esc(value: object) -> str:
 def render_leaderboard(rows: list[dict]) -> str:
     entries = leaderboard_entries(rows)
     summaries = aggregate_entries(rows)
+    escaped = html.escape
+
+    def num(value: object, digits: int = 3) -> float | None:
+        try:
+            return round(float(value), digits)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    eligible_entries = [entry for entry in entries if entry["_eligible"]]
+    decode_values = [num(entry.get("decode_speedup")) for entry in eligible_entries]
+    decode_values = [value for value in decode_values if value is not None]
+    encode_values = [num(entry.get("encode_speedup")) for entry in eligible_entries]
+    encode_values = [value for value in encode_values if value is not None]
+    best_score = max((entry["_score"] for entry in eligible_entries), default=None)
+    cards = [
+        ("Runs", str(len(entries))),
+        ("Eligible", str(len(eligible_entries))),
+        ("Best score", f"{best_score:.1f}" if best_score is not None else "—"),
+        (
+            "Median decode",
+            f"x{_median(decode_values):.3f}" if decode_values else "—",
+        ),
+        (
+            "Median encode",
+            f"x{_median(encode_values):.3f}" if encode_values else "—",
+        ),
+        ("Models", str(len(summaries))),
+    ]
+    cards_html = "".join(
+        f'<div class="card"><span>{escaped(label)}</span><b>{escaped(value)}</b></div>'
+        for label, value in cards
+    )
+
+    def status_of(entry: dict) -> tuple[str, str]:
+        if entry.get("agent_error") or str(entry.get("outcome") or "") in {
+            "agent-error",
+            "provider-error",
+        }:
+            return "agent-error", "warn"
+        if entry["_eligible"]:
+            return "eligible", "good"
+        return "ineligible", "bad"
+
+    body = []
+    for index, entry in enumerate(entries, 1):
+        status, status_kind = status_of(entry)
+        model = escaped(str(entry.get("model", "")))
+        variant = escaped(str(entry.get("variant") or "default"))
+        hardware = str(entry.get("hardware") or "").strip()
+        hardware_line = (
+            f'<div class="hardware">{escaped(hardware)}</div>' if hardware else ""
+        )
+        issue = entry.get("_issue")
+        issue_url = str(entry.get("_issue_url") or "")
+        if issue is not None and issue_url:
+            source = (
+                f'<a href="{escaped(issue_url)}" rel="noreferrer">#{escaped(str(issue))}</a>'
+            )
+        else:
+            source = '<span class="muted">—</span>'
+        if entry.get("verified"):
+            evidence = '<span class="evidence verified">maintainer-checked</span>'
+        elif issue is not None:
+            evidence = '<span class="evidence reported">self-reported</span>'
+        else:
+            evidence = '<span class="evidence local">local</span>'
+        decode = num(entry.get("decode_speedup"))
+        encode = num(entry.get("encode_speedup"))
+        wall = num(entry.get("wall_s"), 1)
+        tokens = num(entry.get("total_tokens"), 0)
+        timestamp = str(entry.get("timestamp") or "")
+        search = escaped(
+            " ".join(
+                [
+                    str(entry.get("model", "")),
+                    str(entry.get("variant", "")),
+                    str(entry.get("run_id", "")),
+                    hardware,
+                    timestamp,
+                ]
+            ).lower()
+        )
+        body.append(
+            f'<tr class="{"" if entry["_eligible"] else "ineligible"}"'
+            f' data-search="{search}" data-status="{status}"'
+            f' data-score="{entry["_score"]:.6f}"'
+            f' data-decode="{decode if decode is not None else ""}"'
+            f' data-encode="{encode if encode is not None else ""}"'
+            f' data-wall="{wall if wall is not None else ""}"'
+            f' data-tokens="{tokens if tokens is not None else ""}"'
+            f' data-started="{escaped(timestamp)}">'
+            f'<td class="rank">{index}</td>'
+            f'<td class="model"><div>{model} <span class="muted">{variant}</span></div>{hardware_line}</td>'
+            f'<td><div class="score"><span class="bar" style="width:{max(0.0, min(100.0, entry["_score"] / 2)):.1f}%"></span>'
+            f"<b>{entry['_score']:.1f}</b></div></td>"
+            f'<td class="num">{f"x{decode:.3f}" if decode is not None else "—"}</td>'
+            f'<td class="num">{f"x{encode:.3f}" if encode is not None else "—"}</td>'
+            f'<td><span class="status {status_kind}">{status}</span></td>'
+            f'<td>{escaped(str(entry.get("confidence") or "—"))}</td>'
+            f'<td class="num">{escaped(str(entry.get("cpu_set") or "—"))}</td>'
+            f'<td>{escaped(str(entry.get("network_policy") or "—"))}</td>'
+            f'<td class="source">{source}<div>{evidence}</div></td>'
+            f'<td class="started">{escaped(timestamp)}</td>'
+            "</tr>"
+        )
+
     summary_body = []
     for index, entry in enumerate(summaries, 1):
         summary_body.append(
             "<tr>"
-            f"<td>{index}</td>"
-            f"<td><code>{_esc(entry['model'])}</code></td>"
-            f"<td>{_esc(entry['variant'])}</td>"
-            f"<td>{entry['runs']}</td>"
-            f"<td>{entry['median_score']:.1f}</td>"
-            f"<td>{entry['best_score']:.1f}</td>"
-            f"<td>{entry['gate_rate'] * 100:.0f}%</td>"
-            f"<td>{_esc(_fmt(entry['median_decode']))}</td>"
-            f"<td>{_esc(_fmt(entry['median_encode']))}</td>"
-            f"<td>{_esc(entry['confidence'])}</td>"
-            f"<td>{_esc(', '.join(entry['network']))}</td>"
+            f'<td class="rank">{index}</td>'
+            f'<td class="model"><div>{escaped(str(entry["model"]))} <span class="muted">{escaped(str(entry["variant"]))}</span></div></td>'
+            f'<td class="num">{entry["runs"]}</td>'
+            f'<td class="num"><b>{entry["median_score"]:.1f}</b></td>'
+            f'<td class="num">{entry["best_score"]:.1f}</td>'
+            f'<td class="num">{entry["gate_rate"] * 100:.0f}%</td>'
+            f'<td class="num">{_esc(_fmt(entry["median_decode"]))}</td>'
+            f'<td class="num">{_esc(_fmt(entry["median_encode"]))}</td>'
+            f'<td>{escaped(str(entry["confidence"]))}</td>'
+            f'<td>{escaped(", ".join(entry["network"]))}</td>'
             "</tr>"
         )
-    body = []
-    for index, entry in enumerate(entries, 1):
-        status = (
-            "agent-error"
-            if entry.get("agent_error")
-            or str(entry.get("outcome") or "") in {"agent-error", "provider-error"}
-            else ("eligible" if entry["_eligible"] else "ineligible")
-        )
-        body.append(
-            "<tr>"
-            f"<td>{index}</td>"
-            f"<td><code>{_esc(entry.get('model', ''))}</code></td>"
-            f"<td>{_esc(entry.get('variant', 'default'))}</td>"
-            f"<td>{entry['_score']:.1f}</td>"
-            f"<td>{_esc(entry.get('decode_speedup', '—'))}</td>"
-            f"<td>{_esc(entry.get('encode_speedup', '—'))}</td>"
-            f"<td>{status}</td>"
-            f"<td>{_esc(entry.get('cpu_set', '—'))}</td>"
-            f"<td>{_esc(entry.get('network_policy', '—'))}</td>"
-            f"<td>{_esc(entry.get('hardware', ''))}</td>"
-            f"<td>{format_duration(entry.get('wall_s'))}</td>"
-            f"<td>{format_tokens(entry.get('total_tokens'))}</td>"
-            f"<td>{_esc(entry.get('timestamp', ''))}</td>"
-            "</tr>"
-        )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -2181,38 +2262,181 @@ def render_leaderboard(rows: list[dict]) -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>opencode-bench-htj2k leaderboard</title>
 <style>
-body {{ font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #111; }}
-h1 {{ font-size: 1.5rem; }}
-h2 {{ font-size: 1.1rem; margin-top: 2rem; }}
-table {{ border-collapse: collapse; width: 100%; margin-top: 1rem; }}
-th, td {{ border-bottom: 1px solid #ddd; padding: .5rem .6rem; text-align: left; vertical-align: top; }}
-th {{ background: #f5f5f5; font-weight: 600; }}
-code {{ font-size: .9em; }}
-.note {{ color: #555; max-width: 70rem; }}
+:root {{ color-scheme: dark; --bg:#0f1117; --panel:#171a23; --line:#272c3a;
+        --text:#e7ebf5; --muted:#8b93a7; --accent:#4a90d9; --good:#3ecf8e;
+        --warn:#f0b429; --bad:#ef5b5b; }}
+* {{ box-sizing: border-box; }}
+body {{ margin:0; padding:32px; background:var(--bg); color:var(--text);
+       font:15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+header {{ display:flex; gap:24px; align-items:flex-end; justify-content:space-between;
+         flex-wrap:wrap; margin-bottom:20px; }}
+h1 {{ margin:0; font-size:28px; letter-spacing:-.02em; }}
+.sub {{ margin:6px 0 0; color:var(--muted); max-width:60rem; }}
+.cards {{ display:flex; gap:10px; flex-wrap:wrap; }}
+.card {{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:10px 14px; min-width:110px; }}
+.card span {{ display:block; color:var(--muted); font-size:12px; text-transform:uppercase;
+             letter-spacing:.06em; }}
+.card b {{ font-size:20px; font-variant-numeric:tabular-nums; }}
+.formula {{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:12px 16px; color:var(--muted); margin-bottom:18px; }}
+.formula b {{ color:var(--text); }}
+.toolbar {{ display:flex; gap:12px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }}
+input[type="search"] {{ background:var(--panel); border:1px solid var(--line); color:var(--text);
+                       border-radius:8px; padding:9px 12px; min-width:260px; font:inherit; }}
+.toolbar label {{ color:var(--muted); }}
+select {{ background:var(--panel); border:1px solid var(--line); color:var(--text);
+         border-radius:8px; padding:9px 12px; font:inherit; }}
+.table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:12px; }}
+table {{ width:100%; border-collapse:collapse; min-width:1150px; }}
+thead th {{ position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
+           text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:12px 14px;
+           border-bottom:1px solid var(--line); white-space:nowrap; }}
+thead th[data-sort] {{ cursor:pointer; user-select:none; }}
+thead th[data-sort]:hover {{ color:var(--text); }}
+thead th[data-sort]::after {{ content:"↕"; opacity:.35; margin-left:6px; font-size:10px; }}
+thead th[data-sort][data-dir="asc"]::after {{ content:"▲"; opacity:1; }}
+thead th[data-sort][data-dir="desc"]::after {{ content:"▼"; opacity:1; }}
+tbody td {{ padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }}
+tbody tr:last-child td {{ border-bottom:0; }}
+tbody tr:hover {{ background:#1b1f2b; }}
+tr.ineligible {{ opacity:.55; }}
+.rank {{ font-size:18px; font-weight:700; color:var(--muted); }}
+tbody tr:nth-child(1) .rank {{ color:var(--warn); }}
+tbody tr:nth-child(2) .rank {{ color:#c9d1e3; }}
+tbody tr:nth-child(3) .rank {{ color:#b07d4f; }}
+.score {{ position:relative; min-width:110px; height:24px; display:flex; align-items:center; }}
+.score .bar {{ position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#2f6db3,#4a90d9);
+              border-radius:6px; opacity:.55; }}
+.score b {{ position:relative; padding-left:8px; font-variant-numeric:tabular-nums; }}
+.model div:first-child {{ font-weight:600; }}
+.hardware {{ color:var(--muted); font-size:11px; margin-top:2px; max-width:340px;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+.num, .started {{ font-variant-numeric:tabular-nums; white-space:nowrap; }}
+.started {{ color:var(--muted); }}
+.source {{ white-space:nowrap; }}
+.source a {{ color:var(--accent); text-decoration:none; }}
+.source a:hover {{ text-decoration:underline; }}
+.status {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+          font-weight:700; text-transform:uppercase; letter-spacing:.04em; }}
+.status.good {{ background:rgba(62,207,142,.15); color:var(--good); }}
+.status.warn {{ background:rgba(240,180,41,.15); color:var(--warn); }}
+.status.bad {{ background:rgba(239,91,91,.15); color:var(--bad); }}
+.evidence {{ display:inline-block; margin-top:3px; padding:1px 7px; border-radius:999px;
+            font-size:10px; text-transform:uppercase; letter-spacing:.05em; }}
+.evidence.reported {{ background:rgba(240,180,41,.15); color:var(--warn); }}
+.evidence.verified {{ background:rgba(62,207,142,.15); color:var(--good); }}
+.evidence.local {{ background:rgba(74,144,217,.15); color:var(--accent); }}
+.muted {{ color:var(--muted); }}
+.median-wrap {{ margin-top:18px; background:var(--panel); border:1px solid var(--line);
+                border-radius:12px; padding:10px 14px; }}
+.median-wrap summary {{ cursor:pointer; color:var(--muted); font-weight:600; }}
+.median-wrap .table-wrap {{ margin-top:10px; border:0; }}
+.median-wrap table {{ min-width:900px; }}
+.empty {{ color:var(--muted); }}
 </style>
 </head>
 <body>
-<h1>opencode-bench-htj2k</h1>
-<p class="note">Lossless HTJ2K encode/decode optimisation. Score is seed-normalised:
-the untouched seed is 0, matching the frozen target in both dimensions is 100.
-Correctness gates must pass for eligibility. One run is accepted, but single-run
-entries are low-confidence; three runs with different seeds are recommended.
-The grader runs on one pinned CPU; the agent network is labelled per run.
-Rows are local artifacts unless a community submission says otherwise.</p>
-<h2>Models</h2>
-<table>
-<thead><tr><th>#</th><th>model</th><th>variant</th><th>runs</th><th>median score</th><th>best</th><th>gate rate</th><th>decode</th><th>encode</th><th>confidence</th><th>network</th></tr></thead>
+<header>
+  <div>
+    <h1>opencode-bench-htj2k</h1>
+    <p class="sub">Lossless HTJ2K encode/decode optimisation. Score is seed-normalised: the
+    untouched seed is 0, matching the frozen target in both dimensions is 100 (cap 200).
+    Correctness gates must pass for eligibility. The grader runs on one pinned CPU and the
+    agent network is labelled per run. One run is accepted but low-confidence; three runs
+    with different seeds are recommended. Rows marked <i>self-reported</i> are community
+    submissions, <i>maintainer-checked</i> ones are verified.</p>
+  </div>
+  <div class="cards">{cards_html}</div>
+</header>
+<div class="formula">score = <b>100 · (0.5 · decode-credit + 0.5 · encode-credit)</b>,
+credited per dimension as clamp((speedup − 1 − 0.08) / (target − 1 − 0.08), 0, 2) against
+frozen targets (decode x1.35, encode x1.25). Ineligible rows keep 75% of their score and are dimmed.</div>
+<div class="toolbar">
+  <input id="search" type="search" placeholder="Filter by model, run id, hardware…">
+  <label>status
+    <select id="status">
+      <option value="">all</option>
+      <option value="eligible">eligible</option>
+      <option value="ineligible">ineligible</option>
+      <option value="agent-error">agent-error</option>
+    </select>
+  </label>
+</div>
+<div class="table-wrap">
+<table id="runs">
+<thead><tr>
+<th>##</th>
+<th>model</th>
+<th data-sort="score">score</th>
+<th data-sort="decode">decode</th>
+<th data-sort="encode">encode</th>
+<th>status</th>
+<th>confidence</th>
+<th>cpu</th>
+<th>network</th>
+<th>source</th>
+<th data-sort="started">run</th>
+</tr></thead>
 <tbody>
-{''.join(summary_body) or '<tr><td colspan="11">no runs yet</td></tr>'}
+{''.join(body) or '<tr><td colspan="11" class="empty">no runs yet</td></tr>'}
 </tbody>
 </table>
-<h2>Runs</h2>
+</div>
+<details class="median-wrap">
+<summary>Models (median over runs)</summary>
+<div class="table-wrap">
 <table>
-<thead><tr><th>#</th><th>model</th><th>variant</th><th>score</th><th>decode</th><th>encode</th><th>status</th><th>cpu</th><th>network</th><th>hardware</th><th>wall</th><th>tokens</th><th>run</th></tr></thead>
+<thead><tr><th>##</th><th>model</th><th>runs</th><th>median score</th><th>best</th><th>gate rate</th><th>decode</th><th>encode</th><th>confidence</th><th>network</th></tr></thead>
 <tbody>
-{''.join(body) or '<tr><td colspan="13">no runs yet</td></tr>'}
+{''.join(summary_body) or '<tr><td colspan="10" class="empty">no runs yet</td></tr>'}
 </tbody>
 </table>
+</div>
+</details>
+<script>
+(function () {{
+  var search = document.getElementById('search');
+  var status = document.getElementById('status');
+  var table = document.getElementById('runs');
+  var rows = Array.prototype.slice.call(table.tBodies[0].rows);
+  function apply() {{
+    var q = search.value.toLowerCase();
+    var st = status.value;
+    rows.forEach(function (row) {{
+      var ok = (!q || row.dataset.search.indexOf(q) !== -1)
+        && (!st || row.dataset.status === st);
+      row.style.display = ok ? '' : 'none';
+    }});
+  }}
+  search.addEventListener('input', apply);
+  status.addEventListener('change', apply);
+  Array.prototype.forEach.call(table.tHead.rows[0].cells, function (th) {{
+    if (!th.dataset.sort) return;
+    th.addEventListener('click', function () {{
+      var key = th.dataset.sort;
+      var dir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
+      Array.prototype.forEach.call(table.tHead.rows[0].cells, function (other) {{
+        other.removeAttribute('data-dir');
+      }});
+      th.dataset.dir = dir;
+      var mult = dir === 'asc' ? 1 : -1;
+      rows.sort(function (a, b) {{
+        var av = a.dataset[key] || '';
+        var bv = b.dataset[key] || '';
+        var an = parseFloat(av);
+        var bn = parseFloat(bv);
+        var cmp = (av !== '' && bv !== '' && !isNaN(an) && !isNaN(bn))
+          ? an - bn
+          : String(av).localeCompare(String(bv));
+        return cmp * mult;
+      }});
+      rows.forEach(function (row) {{ table.tBodies[0].appendChild(row); }});
+      apply();
+    }});
+  }});
+}})();
+</script>
 </body>
 </html>
 """
@@ -4030,6 +4254,7 @@ def cmd_site(args: argparse.Namespace) -> int:
             "total_tokens": data.get("total_tokens"),
             "timestamp": data.get("timestamp"),
             "_issue": issue.get("number"),
+            "_issue_url": issue.get("url"),
         }
         if VERIFIED_LABEL in labels:
             row["verified"] = True
@@ -4045,8 +4270,6 @@ def cmd_site(args: argparse.Namespace) -> int:
             int(previous.get("_issue") or 0),
         ):
             chosen[key] = row
-    for row in chosen.values():
-        row.pop("_issue", None)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     (output / "index.html").write_text(

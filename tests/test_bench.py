@@ -485,7 +485,8 @@ class LeaderboardTests(unittest.TestCase):
         ]
         page = bench.render_leaderboard(rows)
         self.assertIn("&lt;script&gt;", page)
-        self.assertNotIn("<script>", page)
+        # the only raw script tag is the page's own sort/filter block
+        self.assertEqual(page.count("<script>"), 1)
         entries = bench.leaderboard_entries(rows)
         self.assertEqual(entries[0]["run_id"], "b")
         self.assertAlmostEqual(entries[0]["_score"], 15.0)
