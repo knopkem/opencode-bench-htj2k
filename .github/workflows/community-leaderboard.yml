@@ -41,6 +41,11 @@ jobs:
       (github.event.action == 'unlabeled' && github.event.label.name == 'benchmark-result') ||
       github.event.label.name == 'hidden'
     runs-on: ubuntu-latest
+    outputs:
+      # `success` only when GitHub Pages is (or could be) enabled; the deploy
+      # job is skipped entirely while the repository cannot have Pages (for
+      # example a private repository on a free plan).
+      pages_configured: ${{ steps.configure_pages.outcome }}
     steps:
       - name: Check out the default branch
         uses: actions/checkout@v4
@@ -174,15 +179,25 @@ jobs:
           PY
 
       - name: Configure Pages
+        id: configure_pages
+        # Pages cannot be enabled on a private repository with a free plan.
+        # Tolerate that state: submission validation and adoption above still
+        # run, and deployment starts working as soon as the repository can
+        # have Pages (the action enables it automatically once it can).
+        continue-on-error: true
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Upload Pages artifact
+        if: steps.configure_pages.outcome == 'success'
         uses: actions/upload-pages-artifact@v3
         with:
           path: docs
 
   deploy:
     needs: build
+    if: needs.build.outputs.pages_configured == 'success'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
