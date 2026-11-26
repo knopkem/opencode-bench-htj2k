@@ -73,7 +73,7 @@ jobs:
           docker run --rm --network none "$image" \
             bash -c 'test ! -e /opt/oracle && test ! -e /opt/private'
           docker run --rm --network none "$image" \
-            bash -lc 'opencode --version && cargo --version && python3 --version'
+            bash -c 'opencode --version && cargo --version && python3 --version'
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
