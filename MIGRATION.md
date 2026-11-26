@@ -1,7 +1,9 @@
 # Migration Plan: Public Harness with a Separate Evaluator Image
 
-Status: public history rewritten and force-pushed; private evaluator repository
-created; agent/evaluator images pushed; final package/source visibility remains
+Status: complete — public history rewritten and force-pushed; private
+evaluator repository created; agent/evaluator packages public with anonymous
+pulls verified; source repository public; community leaderboard live at
+https://knopkem.github.io/opencode-bench-htj2k/
 Date: 2026-11-26
 
 ## 0. Current implementation state
@@ -54,12 +56,16 @@ Note: a bare unauthenticated `curl` to GHCR manifest URLs always receives a
 does this automatically). A public package is visible after the dance, a
 private one is not.
 
-Still pending because they require a repository-owner action:
+Completed by the repository owner on 2026-11-26:
 
-1. Re-run the GitHub issue/artifact audit immediately before changing source
-   repository visibility (last audit on 2026-11-26: 4 open benchmark-result
-   issues containing aggregate data only; no PRs, releases, or artifacts).
-2. Make the public source repository public only after that check passes.
+1. Both GHCR packages were made public; anonymous pulls verified end-to-end
+   (registry token dance, `docker pull`/`docker manifest inspect` with no
+   credentials, and a full no-op run against the default image references).
+2. The issue/artifact audit passed: open `benchmark-result` issues contain
+   aggregate submission data only; no PRs, releases, or artifacts.
+3. The source repository was made public. GitHub Pages was enabled by the
+   community-leaderboard workflow (`configure-pages` with `enablement: true`)
+   and the leaderboard is live.
 
 ## 1. Purpose and threat model
 
