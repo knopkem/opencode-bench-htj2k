@@ -37,19 +37,24 @@ Completed for the public repository:
 
 Image releases:
 
-- `ghcr.io/knopkem/opencode-bench-htj2k-agent:edge` was pushed and its
-  package made public. Anonymous HTTP manifest access returns 200.
-- `ghcr.io/knopkem/opencode-bench-htj2k-eval:edge` was built from
-  `knopkem/opencode-bench-htj2k-eval`, passed the private verification
-  (manifest, suite bytecode, oracle, mode-700 probes) plus the local no-op
-  end-to-end run, and was pushed. Its package remains private until the owner
-  explicitly changes visibility.
+- `ghcr.io/knopkem/opencode-bench-htj2k-agent:edge` was built by the public
+  repository's `agent-image.yml` workflow (linux/amd64 + linux/arm64),
+  verified (no `/opt/oracle`/`/opt/private`, cargo/python3/opencode present)
+  and pushed. Its package remains private until the owner explicitly changes
+  visibility; anonymous HTTP manifest access currently returns 401.
+- `ghcr.io/knopkem/opencode-bench-htj2k-eval:edge` was built by the private
+  evaluator repository's `evaluator-image.yml` workflow (linux/amd64 +
+  linux/arm64), passed the private verification (manifest, suite bytecode,
+  oracle startup, mode-700 probes) and was pushed. Its package also remains
+  private until the owner explicitly changes visibility.
 
 Still pending because they require repository-owner actions:
 
-1. Make `opencode-bench-htj2k-eval` (the GHCR package) public only when ready
-   to distribute the evaluator suite image. Anyone pulling it can inspect and
-   recover the tests and the oracle.
+1. Make the `opencode-bench-htj2k-agent` and `opencode-bench-htj2k-eval`
+   GHCR packages public (package settings in the GitHub UI, or a token with
+   `write:packages`). Anyone pulling the evaluator image can inspect and
+   recover the tests and the oracle; only do this when ready to distribute
+   the evaluator suite image.
 2. Re-run the GitHub issue/artifact audit immediately before changing source
    repository visibility.
 3. Make the public source repository public only after those checks pass.
