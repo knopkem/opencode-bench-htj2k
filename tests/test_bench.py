@@ -13,6 +13,50 @@ sys.path.insert(0, str(ROOT))
 import bench  # noqa: E402
 
 
+def make_manifest() -> dict:
+    """Synthetic suite manifest; the real frozen catalog ships in the evaluator image."""
+    correctness = [
+        {
+            "id": "gray-8-256-d5-4x1024-lrcp",
+            "width": 256,
+            "height": 256,
+            "bit_depth": 8,
+            "decompositions": 5,
+            "block_size": "4x1024",
+            "progression": "LRCP",
+        },
+        {
+            "id": "gray-12-512-d5-4x1024-lrcp",
+            "width": 512,
+            "height": 512,
+            "bit_depth": 12,
+            "decompositions": 5,
+            "block_size": "4x1024",
+            "progression": "LRCP",
+        },
+    ]
+    return {
+        "schema": bench.MANIFEST_SCHEMA,
+        "suite_version": bench.SUITE_VERSION,
+        "seed": 1,
+        "description": "unit-test fixture",
+        "limits": {"perf_repetitions": 9, "noise_floor": 0.08},
+        "targets": {"decode": 1.35, "encode": 1.25},
+        "correctness": correctness,
+        "decode_extra": [{"id": "gray-8-512-d5-4x1024-rpcl"}],
+        "perf": {
+            "decode": [
+                {"id": "decode-12bit-4x1024", "kind": "decode"},
+                {"id": "decode-8bit-64x64", "kind": "decode"},
+            ],
+            "encode": [
+                {"id": "encode-12bit-4x1024", "kind": "encode"},
+                {"id": "encode-8bit-4x1024", "kind": "encode"},
+            ],
+        },
+    }
+
+
 def fake_results(
     manifest: dict,
     speedup: float = 1.0,
@@ -77,7 +121,7 @@ def fake_results(
 
 class ScoringTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.manifest = bench.load_manifest()
+        self.manifest = make_manifest()
         self.build = {"build_ok": True, "seed_build_ok": True, "typecheck_ok": True, "binary": True}
 
     def score(
@@ -450,7 +494,7 @@ class LeaderboardTests(unittest.TestCase):
 
 class MeasurementTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.manifest = bench.load_manifest()
+        self.manifest = make_manifest()
 
     def test_combine_repeats_uses_median_speedup(self) -> None:
         first = fake_results(self.manifest, decode_speedup=1.20, encode_speedup=1.00)
@@ -560,6 +604,96 @@ class MeasurementTests(unittest.TestCase):
             prompt = bench.write_continue_prompt(workdir, 2, 1, 420.0)
             self.assertTrue(prompt.exists())
             self.assertIn("7 minutes", prompt.read_text())
+
+
+class EvaluatorImageTests(unittest.TestCase):
+    def test_public_image_defaults(self) -> None:
+        self.assertTrue(bench.DEFAULT_AGENT_IMAGE.startswith("ghcr.io/"))
+        self.assertIn("agent", bench.DEFAULT_AGENT_IMAGE)
+        self.assertTrue(bench.DEFAULT_TEST_IMAGE.startswith("ghcr.io/"))
+        self.assertIn("eval", bench.DEFAULT_TEST_IMAGE)
+
+    def test_load_manifest_requires_image(self) -> None:
+        with self.assertRaises(SystemExit):
+            bench.load_manifest()
+        with self.assertRaises(SystemExit):
+            bench.load_manifest("docker", "")
+
+    def test_validate_suite_manifest(self) -> None:
+        manifest = make_manifest()
+        self.assertIs(bench.validate_suite_manifest(manifest), manifest)
+        broken = dict(manifest)
+        del broken["correctness"]
+        with self.assertRaises(SystemExit):
+            bench.validate_suite_manifest(broken)
+        broken = dict(manifest, targets={"decode": 1.0})
+        with self.assertRaises(SystemExit):
+            bench.validate_suite_manifest(broken)
+
+    def test_collect_image_metadata(self) -> None:
+        original_identifier = bench.image_identifier
+        original_labels = bench.image_labels
+        try:
+            bench.image_identifier = lambda engine, image: f"digest:{image}"  # noqa: E731
+            bench.image_labels = lambda engine, image: {  # noqa: E731
+                "org.opencode-bench.evaluator-suite-version": "edge"
+            }
+            meta = bench.collect_image_metadata("docker", "agent:edge", "eval:edge")
+        finally:
+            bench.image_identifier = original_identifier
+            bench.image_labels = original_labels
+        self.assertEqual(meta["agent_image"], "agent:edge")
+        self.assertEqual(meta["agent_image_id"], "digest:agent:edge")
+        self.assertEqual(meta["test_image"], "eval:edge")
+        self.assertEqual(meta["test_image_id"], "digest:eval:edge")
+        self.assertEqual(meta["test_suite_version"], "edge")
+
+    def test_build_eval_dry_run_uses_private_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            suite = Path(directory) / "suite"
+            (suite / "fixtures").mkdir(parents=True)
+            (suite / "oracle" / "OpenJPH").mkdir(parents=True)
+            (suite / "runner.py").write_text("")
+            (suite / "corpus.py").write_text("")
+            (suite / "oracle" / "oracle.cpp").write_text("")
+            (suite / "oracle" / "OpenJPH" / "CMakeLists.txt").write_text("")
+            (suite / "manifest.json").write_text(json.dumps(make_manifest()))
+            args = argparse.Namespace(
+                engine="docker",
+                tests_dir=str(suite),
+                test_image="eval:local",
+                rust_version="1.83",
+                suite_version="v1",
+                source_revision="abc123",
+                dry_run=True,
+            )
+            self.assertEqual(bench.cmd_build_eval(args), 0)
+
+    def test_build_eval_rejects_incomplete_suite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            args = argparse.Namespace(
+                engine="docker",
+                tests_dir=directory,
+                test_image="eval:local",
+                rust_version="1.83",
+                suite_version=None,
+                source_revision=None,
+                dry_run=True,
+            )
+            self.assertEqual(bench.cmd_build_eval(args), 2)
+
+    def test_check_without_docker(self) -> None:
+        args = argparse.Namespace(
+            no_docker=True,
+            engine="docker",
+            agent_image=bench.DEFAULT_AGENT_IMAGE,
+            test_image=bench.DEFAULT_TEST_IMAGE,
+            cpu_set="0",
+            no_cpu_set=False,
+            network_policy="open",
+            dry_run=True,
+        )
+        self.assertEqual(bench.cmd_check(args), 0)
 
 
 if __name__ == "__main__":

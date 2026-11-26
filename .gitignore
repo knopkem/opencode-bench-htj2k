@@ -7,9 +7,12 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+.private-eval/
 
 # Rust build artifacts in the seed and workdirs
 tasks/htj2k/seed/target/
 tasks/htj2k/seed/corpus/generated/
 
+# The hidden suite lives in the private evaluator repository
+tasks/htj2k/tests/
 tasks/htj2k/tests/oracle/OpenJPH/build/

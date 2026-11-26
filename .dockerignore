@@ -4,5 +4,7 @@ __pycache__/
 *.pyc
 .git/
 .venv/
+.private-eval/
 tasks/htj2k/seed/target/
 tasks/htj2k/seed/corpus/generated/
+tasks/htj2k/tests/

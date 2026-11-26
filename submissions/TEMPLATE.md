@@ -19,7 +19,9 @@ Results are self-reported unless a maintainer adds `verified`.
 The canonical schema is [`schema.json`](schema.json). The block printed by
 `bench.py submit` is what the site and issue form consume. Include
 `network_policy` (`open` or `offline`), `cpu_set`, `rounds` and `confidence` so
-the page does not mix incompatible results.
+the page does not mix incompatible results. The block also records the
+`agent_image` / `test_image` references and the evaluator suite version used,
+so runs scored against different images stay distinguishable.
 
 ## Ranking
 

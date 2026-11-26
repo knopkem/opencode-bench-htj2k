@@ -20,8 +20,8 @@ containers.
 ## Quick start
 
 ```bash
-./bench.py build                 # build agent and test images
-./bench.py check                 # prompt, seed, manifest, images
+./bench.py build                 # public agent/build image
+./bench.py check                 # prompt, seed, evaluator manifest, images
 ./bench.py models                # local OpenCode providers/models
 ./bench.py run --model provider/model          # 75/75/45 checkpointed rounds
 ./bench.py run --model provider/model --variant high
@@ -41,6 +41,14 @@ Both the agent and grader containers are pinned to one CPU with
 `--cpuset-cpus 0` by default. That makes `nproc` and
 `available_parallelism()` report 1, so local measurements match grading.
 
+The harness defaults to the publicly pullable GHCR images
+`ghcr.io/knopkem/opencode-bench-htj2k-agent:edge` (agent/build) and
+`ghcr.io/knopkem/opencode-bench-htj2k-eval:edge` (evaluator). Override with
+`--agent-image` / `--test-image` or the `OPENCODE_BENCH_AGENT_IMAGE` /
+`OPENCODE_BENCH_EVAL_IMAGE` environment variables. Maintainer-only evaluator
+builds use `./bench.py build-eval --tests-dir <private-suite>` with the
+private `opencode-bench-htj2k-eval` checkout.
+
 ## What the model does
 
 Each run copies `tasks/htj2k/seed/` into a fresh workdir and adds
@@ -48,10 +56,11 @@ Each run copies `tasks/htj2k/seed/` into a fresh workdir and adds
 correctness gate. The model must keep the CLI and codestream contract while
 making decode and encode faster.
 
-The hidden suite is mounted only after the agent exits. The test container has
-no network, runs on one pinned CPU, and executes the candidate as an unprivileged
-user. The independent C++ OpenJPH oracle lives in a mode-700 directory that the
-candidate cannot read.
+The hidden suite runs only after the agent exits, inside the separate
+evaluator image: the runner, frozen manifest, fixtures and the independent C++
+OpenJPH oracle are baked into that image (mode-700 paths the candidate cannot
+read). The evaluator container has no network, runs on one pinned CPU, and
+executes the candidate as an unprivileged user.
 
 The agent run is split into three rounds (75 / 75 / 45 minutes). After each round
 the harness builds the workdir and reports gate status and speedups on a
@@ -93,7 +102,8 @@ frozen target in both dimensions scores `100`; targets are derived from the
 seed/OpenJPH ratios on the reference machine with a 1.25x floor. Correctness
 failure means ineligible and `0`.
 
-The frozen catalog is `tasks/htj2k/tests/manifest.json`: suite `htj2k-v1`,
+The frozen catalog ships inside the evaluator image as
+`/opt/private/manifest.json`: suite `htj2k-v1`,
 per-run validation and held-out final seeds, ten encode+decode cases, five
 decode-only layouts, a DICOM `.201` fixture, malformed-input checks and four
 decode plus four encode throughput workloads. Checkpoints use the validation
@@ -133,31 +143,39 @@ workloads. They are continuous, not pass/fail.
 
 ```text
 bench.py                       harness, Docker orchestration, scoring, leaderboard
-docker/agent.Dockerfile        Ubuntu + Rust + OpenCode (no oracle)
-docker/test.Dockerfile         Ubuntu + Rust + Python + pinned C++ OpenJPH oracle
+docker/agent.Dockerfile        Debian + Rust + OpenCode (public agent/build image)
+docker/evaluator.Dockerfile    evaluator recipe; suite comes from a private build context
 tasks/htj2k/PROMPT.md          candidate-visible contract
 tasks/htj2k/seed/              codec, CLI, public benchmark and public fixtures
-tasks/htj2k/tests/             hidden suite, manifest, corpus and oracle
 tasks/htj2k/CALIBRATION.md     reference measurements and target derivation
 submissions/                   community submission schema and example
 tests/test_bench.py            harness/scoring unit tests
 ```
 
+The hidden suite, fixtures and pinned OpenJPH oracle live in the private
+`opencode-bench-htj2k-eval` repository and are baked into the evaluator image;
+they are not part of this public source tree.
+
 ## Hidden-suite validation
 
 The seed must pass all gates and score `0.0` with no changes. `./bench.py check`
-verifies that both containers report one pinned CPU. The independent oracle must
-decode every fixture. Negative controls and repeated runs are maintainer release
-gates; see `AGENTS.md`.
+verifies that both containers report one pinned CPU and that the evaluator
+image carries the frozen manifest, the suite and the oracle. Negative controls
+and repeated runs are maintainer release gates; see `AGENTS.md`.
 
 ## Trust model
 
-The agent container has network access for the model provider. A model could look
-up OpenJPH source online; the seed is already a port of it, so the gain is
+The agent container has network access for the model provider. A model could
+look up OpenJPH source online; the seed is already a port of it, so the gain is
 limited, but this is **capability evidence, not a security boundary**. Results
 record `network: open`; do not compare them directly with offline/local-model
-results. The hidden corpus is regenerated per run and expected pixels never enter
-the candidate process.
+results. The hidden corpus is regenerated per run and expected pixels never
+enter the candidate process.
+
+A public evaluator image is **scrape reduction, not secrecy**: anyone who can
+pull it can inspect its layers and recover the suite and the oracle. Keeping
+the evaluator package private trades self-service scoring for
+less-discoverable tests; either way, do not treat the suite as confidential.
 
 One run is accepted on the local leaderboard, but it is labelled `single-run`
 and is low-confidence. Three runs with different seeds are recommended for a
@@ -180,7 +198,6 @@ the same session and workdir for up to `--provider-retries` extra attempts
 ## License and attribution
 
 The codec seed is derived from OpenJPH-RS, a BSD-2-Clause pure-Rust port of
-OpenJPH v0.26.3. The oracle is built from the pinned OpenJPH source under
-`tasks/htj2k/tests/oracle/OpenJPH` (BSD-2-Clause). See the notices in
-`tasks/htj2k/seed/crates/htj2k/NOTICE` and
-`tasks/htj2k/tests/oracle/OpenJPH/LICENSE`.
+OpenJPH v0.26.3. The evaluator oracle is built from pinned OpenJPH source in
+the private `opencode-bench-htj2k-eval` repository (BSD-2-Clause). See the
+notices in `tasks/htj2k/seed/crates/htj2k/NOTICE`.

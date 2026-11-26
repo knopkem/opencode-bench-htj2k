@@ -6,14 +6,15 @@ and decode while preserving standard conformance.  Everything that touches the
 task runs in Docker:
 
   * the agent container sees only a fresh copy of the seed workdir;
-  * the hidden suite, pristine seed, corpus generator and independent C++ OpenJPH
-    oracle are mounted only after the agent exits;
-  * the test container has no network and one pinned CPU;
+  * the hidden suite, corpus generator and independent C++ OpenJPH oracle are
+    baked into the separate evaluator image and run only after the agent exits;
+  * the evaluator container has no network and one pinned CPU;
   * the agent run is checkpointed, and the best eligible checkpoint is graded
     on a held-out final corpus.
 
 Usage:
-    ./bench.py build
+    ./bench.py build                              # public agent image
+    ./bench.py build-eval --tests-dir <private>   # evaluator image (maintainers)
     ./bench.py check
     ./bench.py models
     ./bench.py run --model provider/model          # 75/75/45 checkpointed rounds
@@ -52,7 +53,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 TASK_DIR = ROOT / "tasks" / "htj2k"
 SEED_DIR = TASK_DIR / "seed"
-TESTS_DIR = TASK_DIR / "tests"
 PROMPT_PATH = TASK_DIR / "PROMPT.md"
 RUNS_DIR = ROOT / "runs"
 RESULTS_PATH = ROOT / "results-opencode-bench-htj2k.csv"
@@ -61,11 +61,11 @@ LEADERBOARD_PATH = ROOT / "opencode-bench-htj2k-leaderboard.html"
 SUBMISSIONS_DIR = ROOT / "submissions"
 DOCS_DIR = ROOT / "docs"
 
-DEFAULT_AGENT_IMAGE = os.environ.get(
-    "OPENCODE_BENCH_AGENT_IMAGE", "opencode-bench-htj2k-agent:latest"
-)
-DEFAULT_TEST_IMAGE = os.environ.get(
-    "OPENCODE_BENCH_TEST_IMAGE", "opencode-bench-htj2k-test:latest"
+PUBLIC_AGENT_IMAGE = "ghcr.io/knopkem/opencode-bench-htj2k-agent:edge"
+PUBLIC_EVAL_IMAGE = "ghcr.io/knopkem/opencode-bench-htj2k-eval:edge"
+DEFAULT_AGENT_IMAGE = os.environ.get("OPENCODE_BENCH_AGENT_IMAGE", PUBLIC_AGENT_IMAGE)
+DEFAULT_TEST_IMAGE = os.environ.get("OPENCODE_BENCH_EVAL_IMAGE") or os.environ.get(
+    "OPENCODE_BENCH_TEST_IMAGE", PUBLIC_EVAL_IMAGE
 )
 DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 DEFAULT_CPU_SET = os.environ.get("OPENCODE_BENCH_CPUSET", "0")
@@ -77,6 +77,8 @@ MANIFEST_SCHEMA = "opencode-bench/htj2k-manifest@1"
 SUITE_VERSION = "htj2k-v1"
 SUBMISSION_SCHEMA = "opencode-bench/htj2k-result@1"
 PUBLIC_REPO = "knopkem/opencode-bench-htj2k"
+PRIVATE_EVAL_REPO = "knopkem/opencode-bench-htj2k-eval"
+EVALUATOR_MANIFEST = "/opt/private/manifest.json"
 BENCHMARK_LABEL = "benchmark-result"
 HIDDEN_LABEL = "hidden"
 VERIFIED_LABEL = "verified"
@@ -327,6 +329,113 @@ def image_exists(engine: str, image: str) -> bool:
         ).returncode == 0
     except FileNotFoundError:
         return False
+
+
+def image_inspect(engine: str, image: str) -> dict | None:
+    try:
+        proc = subprocess.run(
+            [engine, "image", "inspect", image],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data[0] if isinstance(data, list) and data else None
+
+
+def image_identifier(engine: str, image: str) -> str | None:
+    """Return a repository digest when present, falling back to the local image ID."""
+    data = image_inspect(engine, image)
+    if not data:
+        return None
+    digests = data.get("RepoDigests")
+    if isinstance(digests, list):
+        for digest in digests:
+            if isinstance(digest, str) and digest.strip():
+                return digest.strip()
+    image_id = data.get("Id")
+    return image_id if isinstance(image_id, str) and image_id else None
+
+
+def image_labels(engine: str, image: str) -> dict:
+    data = image_inspect(engine, image)
+    config = data.get("Config") if data else None
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    return labels if isinstance(labels, dict) else {}
+
+
+def ensure_image(engine: str, image: str, *, dry_run: bool = False) -> bool:
+    """Return True when the image is available, pulling public GHCR images once."""
+    if image_exists(engine, image):
+        return True
+    if not image.startswith("ghcr.io/"):
+        return False
+    print(f"pulling {image}")
+    run_command([engine, "pull", image], dry_run=dry_run)
+    return dry_run or image_exists(engine, image)
+
+
+def collect_image_metadata(
+    engine: str, agent_image: str, test_image: str
+) -> dict:
+    """Capture image references and immutable identifiers in run metadata."""
+    return {
+        "agent_image": agent_image,
+        "agent_image_id": image_identifier(engine, agent_image),
+        "test_image": test_image,
+        "test_image_id": image_identifier(engine, test_image),
+        "test_suite_version": image_labels(engine, test_image).get(
+            "org.opencode-bench.evaluator-suite-version"
+        ),
+    }
+
+
+def read_image_manifest(engine: str, image: str) -> tuple[dict | None, str | None]:
+    """Read the frozen suite manifest baked into the evaluator image."""
+    proc = subprocess.run(
+        [
+            engine,
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            image,
+            "cat",
+            EVALUATOR_MANIFEST,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None, proc.stderr.strip() or "evaluator manifest could not be read"
+    try:
+        manifest = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid evaluator manifest: {exc}"
+    if not isinstance(manifest, dict):
+        return None, "invalid evaluator manifest: expected an object"
+    return manifest, None
+
+
+def image_help(engine: str, image: str, *, agent: bool) -> str:
+    if image.startswith("ghcr.io/"):
+        return f"{engine} pull {image}"
+    if agent:
+        return f"./bench.py build --agent-image {image}"
+    return (
+        f"./bench.py build-eval --tests-dir <private-suite> "
+        f"--agent-image <agent-image> --test-image {image}"
+    )
 
 
 def cpu_set_flags(args: argparse.Namespace) -> list[str]:
@@ -1289,13 +1398,6 @@ def run_tests(
     result_file = artifacts / "results.json"
     if result_file.exists():
         result_file.unlink()
-    bundle = artifacts.parent / "tests-bundle.tar"
-    if not dry_run:
-        with tarfile.open(bundle, "w") as archive:
-            for name in ("runner.py", "corpus.py", "manifest.json"):
-                archive.add(TESTS_DIR / name, arcname=name)
-            archive.add(TESTS_DIR / "fixtures", arcname="fixtures")
-        os.chmod(bundle, 0o600)
     command = [
         engine,
         "run",
@@ -1310,8 +1412,6 @@ def run_tests(
         "-v",
         f"{bins}:/bins:ro",
         "-v",
-        f"{bundle}:/bundle.tar:ro",
-        "-v",
         f"{artifacts}:/out",
         "-w",
         "/",
@@ -1322,13 +1422,11 @@ def run_tests(
         image,
         "bash",
         "-c",
-        "set -e; mkdir -p /opt/private; "
-        "tar -C /opt/private -xf /bundle.tar; "
-        "chmod -R 700 /opt/private; "
+        "set -e; "
         "exec python3 -B /opt/private/runner.py "
         "--candidate-bin /bins/candidate --seed-bin /bins/seed "
         "--oracle /opt/oracle/bin/oracle "
-        "--manifest /opt/private/manifest.json "
+        f"--manifest {EVALUATOR_MANIFEST} "
         "--fixtures /opt/private/fixtures "
         "--out /out --scratch /perf "
         f"--run-seed {fixture_seed}"
@@ -2543,7 +2641,12 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
 
     thinking, effort = model_thinking(model, variant)
     variant_label = variant or "default"
-    manifest = load_manifest()
+    for image, agent in ((args.agent_image, True), (args.test_image, False)):
+        if not ensure_image(args.engine, image, dry_run=args.dry_run):
+            raise SystemExit(
+                f"error: image {image} unavailable; run: {image_help(args.engine, image, agent=agent)}"
+            )
+    manifest = load_manifest(args.engine, args.test_image)
     plan = parse_round_plan(args)
     base_seed = int(args.fixture_seed or manifest.get("seed", 1))
     run_hash = int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16)
@@ -2705,7 +2808,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             run_dir,
             workdir,
             engine=args.engine,
-            image=args.test_image,
+            image=args.agent_image,
             dry_run=args.dry_run,
             artifacts_dir=round_dir / "artifacts",
         )
@@ -3000,6 +3103,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     meta["agent_log"] = str(run_dir / "agent-round-1.log")
     meta["build_log"] = str(chosen_dir / "build-run.log")
     meta["test_log"] = str(chosen_dir / "final" / "test.log")
+    meta.update(collect_image_metadata(args.engine, args.agent_image, args.test_image))
     meta["decode_seed_mp_s"] = _mean_metric(final_score.get("decode") or [], "seed_mp_s")
     meta["decode_candidate_mp_s"] = _mean_metric(final_score.get("decode") or [], "candidate_mp_s")
     meta["encode_seed_mp_s"] = _mean_metric(final_score.get("encode") or [], "seed_mp_s")
@@ -3021,17 +3125,39 @@ def _mean_metric(items: list[dict], key: str) -> float | None:
     return sum(values) / len(values) if values else None
 
 
-def load_manifest() -> dict:
-    path = TESTS_DIR / "manifest.json"
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"error: cannot read {path}: {exc}")
+def validate_suite_manifest(manifest: dict) -> dict:
     if manifest.get("schema") != MANIFEST_SCHEMA:
-        raise SystemExit(f"error: {path} schema must be {MANIFEST_SCHEMA!r}")
+        raise SystemExit(f"error: evaluator manifest schema must be {MANIFEST_SCHEMA!r}")
     if manifest.get("suite_version") != SUITE_VERSION:
-        raise SystemExit(f"error: {path} suite_version must be {SUITE_VERSION!r}")
+        raise SystemExit(f"error: evaluator manifest suite_version must be {SUITE_VERSION!r}")
+    if not manifest.get("correctness"):
+        raise SystemExit("error: evaluator manifest has no correctness cases")
+    if not manifest.get("perf", {}).get("decode"):
+        raise SystemExit("error: evaluator manifest has no decode perf workloads")
+    if not manifest.get("perf", {}).get("encode"):
+        raise SystemExit("error: evaluator manifest has no encode perf workloads")
+    for name, target in (manifest.get("targets") or {}).items():
+        try:
+            value = float(target)
+        except (TypeError, ValueError):
+            raise SystemExit(f"error: evaluator manifest target {name} is not numeric")
+        if value < 1.05:
+            raise SystemExit(f"error: evaluator manifest target {name} must be >= 1.05")
+    if int(manifest.get("limits", {}).get("perf_repetitions", 0)) < 3:
+        raise SystemExit("error: evaluator manifest perf_repetitions must be >= 3")
     return manifest
+
+
+def load_manifest(engine: str | None = None, image: str | None = None) -> dict:
+    if not (engine and image):
+        raise SystemExit(
+            "error: the frozen suite manifest lives in the evaluator image; "
+            "run ./bench.py check or pass --engine/--test-image"
+        )
+    manifest, error = read_image_manifest(engine, image)
+    if error:
+        raise SystemExit(f"error: cannot read suite manifest from {image}: {error}")
+    return validate_suite_manifest(manifest)
 
 
 # --------------------------------------------------------------------------- #
@@ -3041,40 +3167,84 @@ def cmd_build(args: argparse.Namespace) -> int:
     if not engine_available(args.engine, args.dry_run):
         eprint(f"error: {args.engine} is not available; start Docker/OrbStack or pass --engine")
         return 2
-    jobs = [
-        (
-            ROOT / "docker" / "agent.Dockerfile",
-            args.agent_image,
-            [
-                "--build-arg",
-                f"RUST_VERSION={args.rust_version}",
-                "--build-arg",
-                f"OPENCODE_VERSION={args.opencode_version}",
-            ],
-        ),
-        (
-            ROOT / "docker" / "test.Dockerfile",
-            args.test_image,
-            ["--build-arg", f"RUST_VERSION={args.rust_version}"],
-        ),
+    command = [
+        args.engine,
+        "build",
+        "-f",
+        str(ROOT / "docker" / "agent.Dockerfile"),
+        "-t",
+        args.agent_image,
+        "--build-arg",
+        f"RUST_VERSION={args.rust_version}",
+        "--build-arg",
+        f"OPENCODE_VERSION={args.opencode_version}",
+        str(ROOT),
     ]
-    for dockerfile, image, extra in jobs:
-        command = [
-            args.engine,
-            "build",
-            "-f",
-            str(dockerfile),
-            "-t",
-            image,
-            *extra,
-            str(ROOT),
-        ]
-        print("+ " + " ".join(shlex.quote(part) for part in command))
-        if not args.dry_run:
-            result = subprocess.run(command, check=False)
-            if result.returncode != 0:
-                return result.returncode
+    print("+ " + " ".join(shlex.quote(part) for part in command))
+    if not args.dry_run:
+        result = subprocess.run(command, check=False)
+        if result.returncode != 0:
+            return result.returncode
     return 0
+
+
+def cmd_build_eval(args: argparse.Namespace) -> int:
+    """Build the evaluator image from a private suite checkout."""
+    tests_dir = Path(args.tests_dir).expanduser().resolve()
+    required = (
+        tests_dir / "runner.py",
+        tests_dir / "corpus.py",
+        tests_dir / "manifest.json",
+        tests_dir / "fixtures",
+        tests_dir / "oracle" / "OpenJPH" / "CMakeLists.txt",
+        tests_dir / "oracle" / "oracle.cpp",
+    )
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        eprint(f"error: evaluator tests directory is incomplete: {tests_dir}")
+        for path in missing:
+            eprint(f"  missing {path}")
+        return 2
+    try:
+        manifest = json.loads((tests_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        eprint(f"error: cannot read {tests_dir / 'manifest.json'}: {exc}")
+        return 2
+    try:
+        validate_suite_manifest(manifest)
+    except SystemExit as exc:
+        eprint(str(exc))
+        return 2
+    if not engine_available(args.engine, args.dry_run):
+        eprint(f"error: {args.engine} is not available; start Docker/OrbStack or pass --engine")
+        return 2
+    suite_version = args.suite_version or os.environ.get(
+        "OPENCODE_BENCH_EVALUATOR_SUITE_VERSION", "local"
+    )
+    source_revision = args.source_revision or os.environ.get(
+        "OPENCODE_BENCH_EVALUATOR_SOURCE_REVISION", "local"
+    )
+    command = [
+        args.engine,
+        "build",
+        "-f",
+        str(ROOT / "docker" / "evaluator.Dockerfile"),
+        "--build-context",
+        f"tests={tests_dir}",
+        "-t",
+        args.test_image,
+        "--build-arg",
+        f"RUST_VERSION={args.rust_version}",
+        "--build-arg",
+        f"EVALUATOR_SUITE_VERSION={suite_version}",
+        "--build-arg",
+        f"EVALUATOR_SOURCE_REVISION={source_revision}",
+        str(ROOT),
+    ]
+    print("+ " + " ".join(shlex.quote(part) for part in command))
+    if args.dry_run:
+        return 0
+    return subprocess.run(command, check=False).returncode
 
 
 def cmd_models(args: argparse.Namespace) -> int:
@@ -3101,8 +3271,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append(f"missing {PROMPT_PATH}")
     if not (ROOT / "docker" / "agent.Dockerfile").exists():
         problems.append("missing docker/agent.Dockerfile")
-    if not (ROOT / "docker" / "test.Dockerfile").exists():
-        problems.append("missing docker/test.Dockerfile")
+    if not (ROOT / "docker" / "evaluator.Dockerfile").exists():
+        problems.append("missing docker/evaluator.Dockerfile")
     if not (SEED_DIR / "Cargo.lock").exists():
         problems.append("missing seed Cargo.lock")
     if not (SEED_DIR / "vendor").exists():
@@ -3111,36 +3281,9 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append("missing seed CLI")
     if not (SEED_DIR / "corpus" / "public" / "manifest.json").exists():
         problems.append("missing public fixtures")
-    if not (TESTS_DIR / "runner.py").exists():
-        problems.append("missing hidden runner")
-    if not (TESTS_DIR / "manifest.json").exists():
-        problems.append("missing hidden manifest")
-    if not (TESTS_DIR / "fixtures" / "ABDOM_1_htj2k.j2c").exists():
-        problems.append("missing DICOM fixture")
-    if not (TESTS_DIR / "oracle" / "OpenJPH" / "CMakeLists.txt").exists():
-        problems.append("missing vendored OpenJPH oracle source")
-    try:
-        manifest = load_manifest()
-    except SystemExit as exc:
-        problems.append(str(exc))
-        manifest = {}
-    if manifest:
-        if not manifest.get("correctness"):
-            problems.append("manifest has no correctness cases")
-        if not manifest.get("perf", {}).get("decode"):
-            problems.append("manifest has no decode perf workloads")
-        if not manifest.get("perf", {}).get("encode"):
-            problems.append("manifest has no encode perf workloads")
-        for name, target in (manifest.get("targets") or {}).items():
-            try:
-                value = float(target)
-            except (TypeError, ValueError):
-                problems.append(f"manifest target {name} is not numeric")
-            else:
-                if value < 1.05:
-                    problems.append(f"manifest target {name} must be >= 1.05")
-        if int(manifest["limits"].get("perf_repetitions", 0)) < 3:
-            problems.append("manifest perf_repetitions must be >= 3")
+    manifest: dict = {}
+    if args.no_docker:
+        print("note: --no-docker skips image and evaluator-suite checks")
     for path in SEED_DIR.rglob("build.rs"):
         if "vendor" in path.parts:
             continue
@@ -3164,11 +3307,30 @@ def cmd_check(args: argparse.Namespace) -> int:
         if not engine_available(args.engine, args.dry_run):
             problems.append(f"{args.engine} is not available")
         else:
-            if not image_exists(args.engine, args.agent_image):
-                problems.append(f"missing image {args.agent_image}; run ./bench.py build")
-            if not image_exists(args.engine, args.test_image):
-                problems.append(f"missing image {args.test_image}; run ./bench.py build")
-            else:
+            agent_ok = ensure_image(args.engine, args.agent_image, dry_run=args.dry_run)
+            if not agent_ok:
+                problems.append(
+                    f"agent image {args.agent_image} unavailable; run: "
+                    f"{image_help(args.engine, args.agent_image, agent=True)}"
+                )
+            test_ok = ensure_image(args.engine, args.test_image, dry_run=args.dry_run)
+            if not test_ok:
+                problems.append(
+                    f"evaluator image {args.test_image} unavailable; run: "
+                    f"{image_help(args.engine, args.test_image, agent=False)}"
+                )
+            if test_ok:
+                image_manifest, error = (None, "dry run") if args.dry_run else read_image_manifest(
+                    args.engine, args.test_image
+                )
+                if error:
+                    problems.append(f"evaluator manifest: {error}")
+                elif isinstance(image_manifest, dict):
+                    try:
+                        manifest = validate_suite_manifest(image_manifest)
+                    except SystemExit as exc:
+                        problems.append(str(exc))
+            if agent_ok and test_ok:
                 if not args.no_cpu_set:
                     for image, label in (
                         (args.test_image, "test"),
@@ -3205,14 +3367,16 @@ def cmd_check(args: argparse.Namespace) -> int:
                         args.test_image,
                         "bash",
                         "-c",
-                        "test -x /opt/oracle/bin/oracle && /opt/oracle/bin/oracle >/dev/null 2>&1; "
+                        "test -x /opt/oracle/bin/oracle && test -f /opt/private/runner.py "
+                        "&& test -f /opt/private/manifest.json && test -d /opt/private/fixtures "
+                        "&& /opt/oracle/bin/oracle >/dev/null 2>&1; "
                         "test $? -eq 2",
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
                 if probe.returncode != 0:
-                    problems.append("test image oracle is missing or does not start")
+                    problems.append("evaluator image oracle or hidden suite is missing or does not start")
                 probe = subprocess.run(
                     [
                         args.engine,
@@ -3223,13 +3387,16 @@ def cmd_check(args: argparse.Namespace) -> int:
                         "bash",
                         "-c",
                         "command -v cargo >/dev/null && command -v python3 >/dev/null "
-                        "&& command -v opencode >/dev/null && test ! -e /opt/oracle",
+                        "&& command -v opencode >/dev/null "
+                        "&& test ! -e /opt/oracle && test ! -e /opt/private",
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
                 if probe.returncode != 0:
-                    problems.append("agent image is missing cargo/python3/opencode or contains /opt/oracle")
+                    problems.append(
+                        "agent image is missing cargo/python3/opencode or contains /opt/oracle or /opt/private"
+                    )
     if problems:
         print("check: FAILED")
         for problem in problems:
@@ -3249,10 +3416,16 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"{gates} gate subcases · targets "
             f"decode x{manifest['targets']['decode']} / encode x{manifest['targets']['encode']}"
         )
-        print(
-            f"  cpu-set {args.cpu_set if not args.no_cpu_set else 'unpinned'} · "
-            f"agent network {args.network_policy} · grader network none"
-        )
+    print(
+        f"  agent image {args.agent_image}"
+    )
+    print(
+        f"  evaluator image {args.test_image}"
+    )
+    print(
+        f"  cpu-set {args.cpu_set if not args.no_cpu_set else 'unpinned'} · "
+        f"agent network {args.network_policy} · grader network none"
+    )
     return 0
 
 
@@ -3443,7 +3616,12 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         return 2
     meta = json.loads(meta_path.read_text())
     workdir = run_dir / "workdir"
-    manifest = load_manifest()
+    for image, agent in ((args.agent_image, True), (args.test_image, False)):
+        if not ensure_image(args.engine, image, dry_run=args.dry_run):
+            raise SystemExit(
+                f"error: image {image} unavailable; run: {image_help(args.engine, image, agent=agent)}"
+            )
+    manifest = load_manifest(args.engine, args.test_image)
     if refresh_provider_status(meta, run_dir):
         print("  reclassified provider failures from the saved agent logs")
     rescore_dir = run_dir / "rescore"
@@ -3451,7 +3629,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         run_dir,
         workdir,
         engine=args.engine,
-        image=args.test_image,
+        image=args.agent_image,
         dry_run=args.dry_run,
         artifacts_dir=rescore_dir,
     )
@@ -3503,6 +3681,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     )
     meta["test_log"] = str(rescore_dir / "test.log")
     meta["build_log"] = str(rescore_dir / "build-run.log")
+    meta.update(collect_image_metadata(args.engine, args.agent_image, args.test_image))
     for row in meta.get("rounds") or []:
         if row.get("round") == meta.get("best_round"):
             row["final_eligible"] = bool(score["eligible"])
@@ -3809,7 +3988,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", default=DEFAULT_ENGINE)
     parser.add_argument("--agent-image", default=DEFAULT_AGENT_IMAGE)
-    parser.add_argument("--test-image", default=DEFAULT_TEST_IMAGE)
+    parser.add_argument(
+        "--test-image",
+        default=DEFAULT_TEST_IMAGE,
+        help="evaluator image (env OPENCODE_BENCH_EVAL_IMAGE or OPENCODE_BENCH_TEST_IMAGE)",
+    )
     parser.add_argument("--config", help="OpenCode config directory or file")
     parser.add_argument("--cpu-set", default=DEFAULT_CPU_SET,
                         help="CPU affinity set for agent and grader (default: 0)")
@@ -3821,13 +4004,43 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("build", help="build agent and test images")
+    p = sub.add_parser("build", help="build the public agent/build image")
+    p.add_argument("--agent-image", default=argparse.SUPPRESS)
     p.add_argument("--opencode-version", default="2.2.5")
     p.add_argument("--rust-version", default="1.83")
+    p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
     p.set_defaults(func=cmd_build)
 
-    p = sub.add_parser("check", help="validate prompt, seed, manifest and images")
+    p = sub.add_parser(
+        "build-eval",
+        help="build the evaluator image from a private suite checkout",
+    )
+    p.add_argument("--agent-image", default=argparse.SUPPRESS)
+    p.add_argument("--test-image", default=argparse.SUPPRESS)
+    p.add_argument(
+        "--tests-dir",
+        required=True,
+        help="private directory containing the hidden suite (runner.py, manifest.json, fixtures, oracle)",
+    )
+    p.add_argument(
+        "--suite-version",
+        default=None,
+        help="suite version stored in the evaluator image (default: local)",
+    )
+    p.add_argument(
+        "--source-revision",
+        default=None,
+        help="private suite source revision recorded in the evaluator image",
+    )
+    p.add_argument("--rust-version", default="1.83")
+    p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_build_eval)
+
+    p = sub.add_parser("check", help="validate prompt, seed, evaluator manifest and images")
+    p.add_argument("--agent-image", default=argparse.SUPPRESS)
+    p.add_argument("--test-image", default=argparse.SUPPRESS)
     p.add_argument("--no-docker", action="store_true")
+    p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
     p.set_defaults(func=cmd_check)
 
     p = sub.add_parser("models", help="list models from the local OpenCode config")
@@ -3835,6 +4048,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_models)
 
     p = sub.add_parser("run", help="run the agent and score it")
+    p.add_argument("--agent-image", default=argparse.SUPPRESS)
+    p.add_argument("--test-image", default=argparse.SUPPRESS)
     p.add_argument("--model", required=True)
     p.add_argument("--variant")
     p.add_argument("--reps", type=int, default=1)
@@ -3885,6 +4100,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("rescore", help="rebuild and rerun a saved workdir")
     p.add_argument("run", nargs="?")
     p.add_argument("--run", dest="run_id")
+    p.add_argument("--agent-image", default=argparse.SUPPRESS)
+    p.add_argument("--test-image", default=argparse.SUPPRESS)
+    p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
     p.add_argument("--final-reps", type=int, default=2,
                    help="repeat the held-out grading this many times "
                         "(median per-workload speedup; 1 disables)")

@@ -10,20 +10,28 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
 - `tasks/htj2k/seed/` is copied into each run. It must build offline with
   `cargo build --release --offline --locked`, pass every correctness gate and
   score exactly `0.0` untouched.
-- `tasks/htj2k/tests/` is hidden. It is mounted only into the test container.
-  `manifest.json` is the catalog source of truth.
-- `tasks/htj2k/tests/oracle/` holds pinned OpenJPH source and the independent
-  oracle harness. Never mount it into the agent image.
+- The hidden suite lives in the private `opencode-bench-htj2k-eval` repository
+  (local checkout: the gitignored `.private-eval/` directory). Its `tests/`
+  tree is baked into the evaluator image; `manifest.json` is the catalog
+  source of truth. The public source tree must never contain it.
+- `tests/oracle/` (in the private repository) holds pinned OpenJPH source and
+  the independent oracle harness. Never bake it into the agent image.
+- `docker/agent.Dockerfile` builds the public agent/build image;
+  `docker/evaluator.Dockerfile` is the evaluator recipe that consumes the
+  private suite through a named `tests` build context.
 - `runs/`, CSV/report/leaderboard/`docs/` are generated artifacts.
 
 ## Invariants
 
-- Agent image has no OpenJPH binary or library. Test image has the oracle at
-  `/opt/oracle` and the pinned source/build tree at `/opt/src` and `/opt/build`,
-  all mode 700, so uid-1000 candidate processes cannot read them.
-- The agent and test containers are pinned with `--cpuset-cpus <set> --cpus 1`.
-  The default set is `0`. `nproc` and `available_parallelism()` must report 1 in
-  both containers. `--no-cpu-set` is debugging only.
+- Agent image has no OpenJPH binary or library, no `/opt/oracle` and no
+  `/opt/private`. The evaluator image has the oracle at `/opt/oracle` and the
+  pinned source/build tree at `/opt/src` and `/opt/build`, plus the hidden
+  suite at `/opt/private`, all mode 700, so uid-1000 candidate processes
+  cannot read them.
+- The agent and evaluator containers are pinned with
+  `--cpuset-cpus <set> --cpus 1`. The default set is `0`. `nproc` and
+  `available_parallelism()` must report 1 in both containers. `--no-cpu-set`
+  is debugging only.
 - Build phase has no network and no hidden tests. Test phase has no network and
   one pinned CPU. The candidate runs as uid 1000.
 - The candidate only sees staged inputs under `/perf/in` and writes to
@@ -62,8 +70,13 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
 Before publishing a suite change:
 
 ```bash
-./bench.py build
-./bench.py check
+./bench.py build                     # public agent image
+./bench.py build-eval \
+  --tests-dir .private-eval/tests \
+  --test-image opencode-bench-htj2k-eval:local
+./bench.py check \
+  --agent-image opencode-bench-htj2k-agent:local \
+  --test-image opencode-bench-htj2k-eval:local
 python3 -m unittest discover -s tests
 ```
 
@@ -73,8 +86,12 @@ changes no code):
 ```bash
 ./bench.py run --model mock/noop --no-preflight \
   --agent-cmd 'echo noop > /work/COMPLETION.md' \
-  --round-plan 1,1,1
-./bench.py rescore <run_id>
+  --round-plan 1,1,1 \
+  --agent-image opencode-bench-htj2k-agent:local \
+  --test-image opencode-bench-htj2k-eval:local
+./bench.py rescore <run_id> \
+  --agent-image opencode-bench-htj2k-agent:local \
+  --test-image opencode-bench-htj2k-eval:local
 ```
 
 The no-op check also exercises the per-round clock, the staged agent config
@@ -90,10 +107,10 @@ ls runs/<run_id>/agent-round-1-continue1.log
 `./bench.py check` probes both images with the cpuset and fails if `nproc` or
 `sched_getaffinity` is not 1.
 
-The runner can also be invoked directly inside the test image for debugging,
-but the harness bundle path (root-only `/opt/private`) is the supported flow.
-Mount `tasks/htj2k/tests` read-only at `/opt/tests` only for maintainer
-diagnostics; never expose it to the agent.
+The runner can also be invoked directly inside the evaluator image for
+debugging, but the harness path (root-only `/opt/private`) is the supported
+flow. Maintainer diagnostics may mount the private suite checkout read-only;
+never expose it to the agent.
 
 Requirements:
 
@@ -109,8 +126,11 @@ Requirements:
 ## Common pitfalls
 
 - Do not call the C++ oracle from the candidate container or expose
-  `/opt/oracle` to uid 1000.
-- Do not mount `tasks/htj2k/tests` into the agent image.
+  `/opt/oracle` or `/opt/private` to uid 1000.
+- Do not copy the private suite checkout into a public build context, image,
+  issue or other public artifact; use the named `tests` build context.
+- Do not commit `.private-eval/`; it is gitignored but lives inside the
+  working tree.
 - Do not make the perf corpus deterministic across runs; use `--run-seed`.
 - Do not compare absolute MP/s across machines. Only seed-relative speedups and
   the in-run OpenJPH reference are meaningful.
@@ -127,3 +147,4 @@ Requirements:
   the engine recovered from is a blip, not a provider failure: the run stays
   eligible. Unrecovered transient failures resume the session for a bounded
   number of attempts (`--provider-retries`, default 2) inside the round budget.
+

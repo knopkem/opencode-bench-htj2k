@@ -7,8 +7,12 @@ working engine.
 
 ## `./bench.py check` reports a missing image
 
-Run `./bench.py build`. The test image compiles the pinned C++ OpenJPH oracle,
-so the first build takes a few minutes.
+The agent image is built locally with `./bench.py build`. The evaluator image
+(`--test-image`, default `ghcr.io/knopkem/opencode-bench-htj2k-eval:edge`) is
+pulled automatically from GHCR when it is public; maintainer builds use
+`./bench.py build-eval --tests-dir <private-suite>` with the private
+`opencode-bench-htj2k-eval` checkout. The evaluator image compiles the pinned
+C++ OpenJPH oracle, so the first build takes a few minutes.
 
 ## The agent cannot build the codec
 
@@ -19,10 +23,10 @@ outside the allowlist.
 
 ## `rescore` says the seed build failed
 
-The test image compiles both the candidate workdir and the pristine seed. A seed
-failure is a harness/infrastructure error, not a model failure. Check
-`runs/<id>/rounds/round-N/artifacts/build-seed.log`. Do not accept a score
-produced with a broken seed.
+The evaluator image runs both the candidate workdir build and the pristine
+seed build. A seed failure is a harness/infrastructure error, not a model
+failure. Check `runs/<id>/rounds/round-N/artifacts/build-seed.log`. Do not
+accept a score produced with a broken seed.
 
 ## `check` says the image is not pinned to one CPU
 
@@ -81,12 +85,15 @@ seeds for a multi-run median; the page groups rows by model and variant.
 
 ## `p0.dicom-201` fails
 
-The fixture is `tasks/htj2k/tests/fixtures/ABDOM_1_htj2k.dcm` with the
-codestream extracted to `ABDOM_1_htj2k.j2c`. If it fails, first verify the seed:
+The fixture ships inside the evaluator image
+(`/opt/private/fixtures/ABDOM_1_htj2k.dcm`, with the codestream extracted to
+`ABDOM_1_htj2k.j2c`); the private `opencode-bench-htj2k-eval` repository holds
+the copy used at build time. If it fails, first verify the seed against the
+fixture from a maintainer suite checkout:
 
 ```bash
-./target/release/htj2k decode tasks/htj2k/tests/fixtures/ABDOM_1_htj2k.j2c /tmp/out.raw
-cmp /tmp/out.raw tasks/htj2k/tests/fixtures/ABDOM_1_raw.u16le
+./target/release/htj2k decode /path/to/tests/fixtures/ABDOM_1_htj2k.j2c /tmp/out.raw
+cmp /tmp/out.raw /path/to/tests/fixtures/ABDOM_1_raw.u16le
 ```
 
 ## `p0.robustness` fails
