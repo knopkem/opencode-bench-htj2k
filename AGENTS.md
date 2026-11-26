@@ -19,6 +19,10 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
 - `docker/agent.Dockerfile` builds the public agent/build image;
   `docker/evaluator.Dockerfile` is the evaluator recipe that consumes the
   private suite through a named `tests` build context.
+- `.github/workflows/community-leaderboard.yml` validates
+  `benchmark-result` issues, moderates invalid submissions, and rebuilds the
+  public leaderboard site; Pages deployment activates when the repository is
+  public.
 - `runs/`, CSV/report/leaderboard/`docs/` are generated artifacts.
 
 ## Invariants
