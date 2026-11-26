@@ -40,24 +40,26 @@ Image releases:
 - `ghcr.io/knopkem/opencode-bench-htj2k-agent:edge` was built by the public
   repository's `agent-image.yml` workflow (linux/amd64 + linux/arm64),
   verified (no `/opt/oracle`/`/opt/private`, cargo/python3/opencode present)
-  and pushed. Its package remains private until the owner explicitly changes
-  visibility; anonymous HTTP manifest access currently returns 401.
+  and pushed. Its package is **public**; anonymous pulls verified (registry
+  token dance + `docker pull`/`docker manifest inspect` with no credentials,
+  then a full no-op run with the default image references).
 - `ghcr.io/knopkem/opencode-bench-htj2k-eval:edge` was built by the private
   evaluator repository's `evaluator-image.yml` workflow (linux/amd64 +
   linux/arm64), passed the private verification (manifest, suite bytecode,
-  oracle startup, mode-700 probes) and was pushed. Its package also remains
-  private until the owner explicitly changes visibility.
+  oracle startup, mode-700 probes) and was pushed. Its package is **public**
+  as well; anonymous pulls verified the same way.
 
-Still pending because they require repository-owner actions:
+Note: a bare unauthenticated `curl` to GHCR manifest URLs always receives a
+`401` challenge first; clients must complete the bearer-token dance (docker
+does this automatically). A public package is visible after the dance, a
+private one is not.
 
-1. Make the `opencode-bench-htj2k-agent` and `opencode-bench-htj2k-eval`
-   GHCR packages public (package settings in the GitHub UI, or a token with
-   `write:packages`). Anyone pulling the evaluator image can inspect and
-   recover the tests and the oracle; only do this when ready to distribute
-   the evaluator suite image.
-2. Re-run the GitHub issue/artifact audit immediately before changing source
-   repository visibility.
-3. Make the public source repository public only after those checks pass.
+Still pending because they require a repository-owner action:
+
+1. Re-run the GitHub issue/artifact audit immediately before changing source
+   repository visibility (last audit on 2026-11-26: 4 open benchmark-result
+   issues containing aggregate data only; no PRs, releases, or artifacts).
+2. Make the public source repository public only after that check passes.
 
 ## 1. Purpose and threat model
 
