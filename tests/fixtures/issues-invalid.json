@@ -1,0 +1,35 @@
+[
+  {
+    "number": 101,
+    "title": "[result] broken json",
+    "body": "## result\n\n```json\n{\"schema\": \"opencode-bench/htj2k-result@1\", \"run_id\": \"x\"\n```\n",
+    "url": "https://github.com/knopkem/opencode-bench-htj2k/issues/101",
+    "labels": [
+      {
+        "name": "benchmark-result"
+      }
+    ]
+  },
+  {
+    "number": 102,
+    "title": "[result] no block",
+    "body": "I ran the benchmark, trust me.",
+    "url": "https://github.com/knopkem/opencode-bench-htj2k/issues/102",
+    "labels": [
+      {
+        "name": "benchmark-result"
+      }
+    ]
+  },
+  {
+    "number": 103,
+    "title": "[result] wrong schema",
+    "body": "```json\n{\"schema\": \"nope\", \"run_id\": \"y\"}\n```",
+    "url": "https://github.com/knopkem/opencode-bench-htj2k/issues/103",
+    "labels": [
+      {
+        "name": "benchmark-result"
+      }
+    ]
+  }
+]

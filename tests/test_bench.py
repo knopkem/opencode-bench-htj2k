@@ -696,5 +696,86 @@ class EvaluatorImageTests(unittest.TestCase):
         self.assertEqual(bench.cmd_check(args), 0)
 
 
+class SiteTests(unittest.TestCase):
+    fixtures = ROOT / "tests" / "fixtures"
+
+    def test_submit_check_accepts_fenced_body_on_stdin_shape(self) -> None:
+        issues = json.loads((self.fixtures / "issues.json").read_text())
+        data, errors = bench.extract_result_block(issues[0]["body"])
+        self.assertIsNotNone(data)
+        self.assertEqual(errors, [])
+        self.assertEqual(bench.validate_submission(data), [])
+
+    def test_submit_check_rejects_garbage(self) -> None:
+        data, errors = bench.extract_result_block("no block here")
+        self.assertIsNone(data)
+        self.assertTrue(errors)
+        data, errors = bench.extract_result_block(None)
+        self.assertIsNone(data)
+        self.assertTrue(errors)
+
+    def test_submit_check_requires_htj2k_schema(self) -> None:
+        body = '```json\n{"schema": "nope", "run_id": "x"}\n```'
+        data, errors = bench.extract_result_block(body)
+        self.assertIsNone(data)
+        self.assertTrue(errors)
+
+    def test_site_renders_valid_and_reports_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "site"
+            errors_path = Path(directory) / "errors.json"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues.json"),
+                output=str(out),
+                errors=str(errors_path),
+            )
+            self.assertEqual(bench.cmd_site(args), 0)
+            page = (out / "index.html").read_text()
+            self.assertIn("opencode-bench-htj2k leaderboard", page)
+            self.assertIn("deepseek-flash", page)
+            self.assertEqual(json.loads(errors_path.read_text()), [])
+
+    def test_site_rejects_invalid_issues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "site"
+            errors_path = Path(directory) / "errors.json"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues-invalid.json"),
+                output=str(out),
+                errors=str(errors_path),
+            )
+            self.assertEqual(bench.cmd_site(args), 0)
+            page = (out / "index.html").read_text()
+            self.assertNotIn("deepseek", page)
+            errors = json.loads(errors_path.read_text())
+            self.assertEqual(len(errors), 3)
+            self.assertTrue(all(item["errors"] for item in errors))
+
+    def test_site_dedups_resubmitted_run_id(self) -> None:
+        issue = json.loads((self.fixtures / "issues.json").read_text())[0]
+        data, _ = bench.extract_result_block(issue["body"])
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / "site"
+            args = argparse.Namespace(
+                issues=str(self.fixtures / "issues.json"),
+                output=str(out),
+                errors=None,
+            )
+            self.assertEqual(bench.cmd_site(args), 0)
+            baseline = (out / "index.html").read_text().count(str(data["model"]))
+            self.assertGreater(baseline, 0)
+            issues_path = Path(directory) / "issues.json"
+            issues_path.write_text(json.dumps([dict(issue, number=201), dict(issue, number=202)]))
+            out2 = Path(directory) / "site2"
+            args2 = argparse.Namespace(
+                issues=str(issues_path),
+                output=str(out2),
+                errors=None,
+            )
+            self.assertEqual(bench.cmd_site(args2), 0)
+            page = (out2 / "index.html").read_text()
+            self.assertEqual(page.count(str(data["model"])), baseline)
+
+
 if __name__ == "__main__":
     unittest.main()

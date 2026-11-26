@@ -3770,6 +3770,46 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     return 0
 
 
+FENCED_BLOCK_RE = re.compile(r"```([A-Za-z0-9_-]*)\s*\n(.*?)```", re.DOTALL)
+
+
+def _fenced_blocks(body: str) -> list[tuple[str, str, str]]:
+    return [
+        (match.group(1).strip().lower(), match.group(0), match.group(2).strip("\n"))
+        for match in FENCED_BLOCK_RE.finditer(body)
+    ]
+
+
+def extract_result_block(body: object) -> tuple[dict | None, list[str]]:
+    """Extract exactly one opencode-bench-htj2k result block from an issue body."""
+    if not isinstance(body, str):
+        return None, ["issue body is missing"]
+    candidates: list[dict] = []
+    parse_errors: list[str] = []
+    for _language, _raw, text in _fenced_blocks(body):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            if "opencode-bench/htj2k-result" in text:
+                parse_errors.append(f"invalid JSON block: {exc}")
+            continue
+        if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
+            candidates.append(parsed)
+    if len(candidates) == 1:
+        return candidates[0], []
+    if len(candidates) > 1:
+        return None, ["issue contains more than one result block"]
+    if parse_errors:
+        return None, parse_errors
+    try:
+        parsed = json.loads(body.strip())
+    except json.JSONDecodeError:
+        return None, ["issue body does not contain a fenced JSON result block"]
+    if isinstance(parsed, dict) and parsed.get("schema") == SUBMISSION_SCHEMA:
+        return parsed, []
+    return None, [f"JSON block must contain schema {SUBMISSION_SCHEMA!r}"]
+
+
 def submission_from_score(meta: dict) -> dict:
     outcome = str(meta.get("outcome") or "")
     agent_error = meta.get("agent_error")
@@ -3866,14 +3906,22 @@ def validate_submission(data: object) -> list[str]:
 
 def cmd_submit(args: argparse.Namespace) -> int:
     if args.check:
-        path = Path(args.check)
-        data = json.loads(path.read_text())
-        problems = validate_submission(data)
-        if problems:
-            for problem in problems:
-                print(f"  - {problem}")
-            return 1
-        print("submission: ok")
+        if args.check == "-":
+            text = sys.stdin.read()
+        else:
+            try:
+                text = Path(args.check).read_text(encoding="utf-8")
+            except OSError as exc:
+                eprint(f"error: cannot read {args.check}: {exc}")
+                return 1
+        data, errors = extract_result_block(text)
+        if data is not None:
+            errors = validate_submission(data)
+        if errors:
+            for error in errors:
+                eprint(f"error: {error}")
+            return 2
+        print("ok")
         return 0
     run_id = getattr(args, "run_id", None) or args.run
     if not run_id:
@@ -3927,57 +3975,89 @@ def cmd_submit(args: argparse.Namespace) -> int:
 
 
 def cmd_site(args: argparse.Namespace) -> int:
-    path = Path(args.issues)
-    issues = json.loads(path.read_text())
-    rows = []
-    for issue in issues:
-        labels = {label.get("name") for label in issue.get("labels", [])}
+    try:
+        payload = json.loads(Path(args.issues).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        eprint(f"error: cannot read {args.issues}: {exc}")
+        return 1
+    if not isinstance(payload, list):
+        eprint("error: issues JSON must be an array")
+        return 1
+    errors: list[dict] = []
+    rows: list[dict] = []
+    for issue in payload:
+        if not isinstance(issue, dict):
+            continue
+        labels = {label.get("name") for label in issue.get("labels") or []}
         if BENCHMARK_LABEL not in labels or HIDDEN_LABEL in labels:
             continue
-        body = issue.get("body") or ""
-        match = re.search(r"```json\s*(\{.*?\})\s*```", body, re.DOTALL)
-        if not match:
+        data, block_errors = extract_result_block(issue.get("body"))
+        if data is None:
+            errors.append(
+                {
+                    "issue": issue.get("number"),
+                    "url": issue.get("url"),
+                    "errors": block_errors,
+                }
+            )
             continue
-        try:
-            data = json.loads(match.group(1))
-        except json.JSONDecodeError:
+        problems = validate_submission(data)
+        if problems:
+            errors.append(
+                {
+                    "issue": issue.get("number"),
+                    "url": issue.get("url"),
+                    "errors": problems,
+                }
+            )
             continue
-        if data.get("schema") != SUBMISSION_SCHEMA:
-            continue
-        data["_issue"] = issue.get("number")
+        row = {
+            "run_id": data.get("run_id"),
+            "model": data.get("model"),
+            "variant": data.get("variant"),
+            "score": data.get("score"),
+            "decode_speedup": data.get("decode_speedup"),
+            "encode_speedup": data.get("encode_speedup"),
+            "eligible": data.get("eligible"),
+            "gate_ok": data.get("gate_ok"),
+            "perf_valid": data.get("perf_valid"),
+            "network_policy": data.get("network_policy"),
+            "cpu_set": data.get("cpu_set"),
+            "confidence": data.get("confidence"),
+            "agent_error": data.get("agent_error"),
+            "hardware": data.get("hardware"),
+            "wall_s": data.get("wall_s"),
+            "total_tokens": data.get("total_tokens"),
+            "timestamp": data.get("timestamp"),
+            "_issue": issue.get("number"),
+        }
         if VERIFIED_LABEL in labels:
-            data["verified"] = True
-        rows.append(data)
+            row["verified"] = True
+        rows.append(row)
+    # Keep the newest submission per run_id (resubmissions update in place).
+    chosen: dict[str, dict] = {}
+    for row in rows:
+        key = str(row.get("run_id") or "")
+        previous = chosen.get(key)
+        new_key = (str(row.get("timestamp") or ""), int(row.get("_issue") or 0))
+        if previous is None or new_key >= (
+            str(previous.get("timestamp") or ""),
+            int(previous.get("_issue") or 0),
+        ):
+            chosen[key] = row
+    for row in chosen.values():
+        row.pop("_issue", None)
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
     (output / "index.html").write_text(
-        render_leaderboard(
-            [
-                {
-                    "run_id": row.get("run_id"),
-                    "model": row.get("model"),
-                    "variant": row.get("variant"),
-                    "score": row.get("score"),
-                    "decode_speedup": row.get("decode_speedup"),
-                    "encode_speedup": row.get("encode_speedup"),
-                    "eligible": row.get("eligible"),
-                    "gate_ok": row.get("gate_ok"),
-                    "perf_valid": row.get("perf_valid"),
-                    "network_policy": row.get("network_policy"),
-                    "cpu_set": row.get("cpu_set"),
-                    "confidence": row.get("confidence"),
-                    "agent_error": row.get("agent_error"),
-                    "hardware": row.get("hardware"),
-                    "wall_s": row.get("wall_s"),
-                    "total_tokens": row.get("total_tokens"),
-                    "timestamp": row.get("timestamp"),
-                }
-                for row in rows
-            ]
-        ),
+        render_leaderboard(list(chosen.values())),
         encoding="utf-8",
     )
-    print(f"wrote {output / 'index.html'} ({len(rows)} submissions)")
+    if args.errors:
+        Path(args.errors).write_text(
+            json.dumps(errors, indent=2) + "\n", encoding="utf-8"
+        )
+    print(f"wrote {output / 'index.html'} ({len(chosen)} submissions, {len(errors)} rejected)")
     return 0
 
 
@@ -4128,6 +4208,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("site", help="render a leaderboard from issue JSON")
     p.add_argument("--issues", required=True)
     p.add_argument("--output", default=str(DOCS_DIR))
+    p.add_argument("--errors", default=None, help="write per-issue validation errors to this JSON file")
     p.set_defaults(func=cmd_site)
 
     return parser

@@ -3,6 +3,9 @@
 A local-LLM benchmark where the model optimises a **working pure-Rust HTJ2K
 codec** for lossless encode and decode throughput.
 
+[View the community leaderboard](https://knopkem.github.io/opencode-bench-htj2k/) ·
+[Submit a result](https://github.com/knopkem/opencode-bench-htj2k/issues/new?template=benchmark-result.yml)
+
 HTJ2K (JPEG 2000 Part 15) is the high-throughput block-coding mode used by
 DICOM transfer syntax `1.2.840.10008.1.2.4.201`. The seed is a pure-Rust port of
 [OpenJPH](https://github.com/aous72/OpenJPH). It is correct, but there is
@@ -194,6 +197,24 @@ followed by more steps in the same log is a blip: the run continues, stays
 eligible, and the report records it. An unrecovered transient failure resumes
 the same session and workdir for up to `--provider-retries` extra attempts
 (default 2) with backoff, but only while the round budget lasts.
+
+## Community leaderboard
+
+Results are submitted as issues with the `benchmark-result` label: either paste
+the block printed by `./bench.py submit --run RUN_ID --print` into the
+[issue form](https://github.com/knopkem/opencode-bench-htj2k/issues/new?template=benchmark-result.yml),
+or create the issue directly with `./bench.py submit --run RUN_ID --gh`.
+The `community-leaderboard.yml` workflow validates each submission, adopts valid
+ones even when the label is missing, comments with concrete errors on invalid
+ones (`needs-attention`), and rebuilds the static leaderboard from open labeled
+issues. Resubmitting the same `run_id` updates the page in place; a maintainer
+`verified` label is cleared automatically when the issue is edited.
+
+The page is published with GitHub Pages at
+[knopkem.github.io/opencode-bench-htj2k](https://knopkem.github.io/opencode-bench-htj2k/).
+It goes live once the source repository is public (GitHub Pages requires a
+public repository); until then the workflow still validates and moderates
+submissions on every issue event.
 
 ## License and attribution
 
