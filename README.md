@@ -65,9 +65,18 @@ OpenJPH oracle are baked into that image (mode-700 paths the candidate cannot
 read). The evaluator container has no network, runs on one pinned CPU, and
 executes the candidate as an unprivileged user.
 
-The agent run is split into three rounds (75 / 75 / 45 minutes). After each round
-the harness builds the workdir and reports gate status and speedups on a
-validation corpus. The final round is graded like the others and may keep
+The agent run is split into three rounds (75 / 75 / 45 minutes). Every agent
+attempt runs on an internal-only Docker network behind a separate egress proxy.
+The proxy allows only the selected model provider and required OpenCode
+infrastructure, without intercepting TLS, so cloud API keys and LAN model
+servers continue to work. Use repeatable `--allow-host HOST[:PORT]` entries for
+additional model/authentication endpoints; evaluation-source hosts cannot be
+approved. Requests denied by the proxy are recorded and evaluation-source
+attempts make the run ineligible while preserving the measured score for
+diagnostics.
+
+After each round the harness builds the workdir and reports gate status and
+speedups on a validation corpus. The final round is graded like the others and may keep
 optimizing until a 10-minute freeze before its deadline. A non-final round that
 ends early with time left is resumed automatically. The official score is the
 best eligible checkpoint, rescored twice on a held-out final corpus and combined
@@ -103,7 +112,9 @@ mode that the other misses. The held-out final grading is repeated twice and
 combined as the median per workload. The untouched seed scores `0`. Matching the
 frozen target in both dimensions scores `100`; targets are derived from the
 seed/OpenJPH ratios on the reference machine with a 1.25x floor. Correctness
-failure means ineligible and `0`.
+failure means ineligible and `0`. A recorded evaluation-source integrity
+violation also means ineligible, but the measured score is kept as diagnostics
+and receives the leaderboard's normal ineligible penalty.
 
 The frozen catalog ships inside the evaluator image as
 `/opt/private/manifest.json`: suite `htj2k-v1`,
@@ -147,6 +158,7 @@ workloads. They are continuous, not pass/fail.
 ```text
 bench.py                       harness, Docker orchestration, scoring, leaderboard
 docker/agent.Dockerfile        Debian + Rust + OpenCode (public agent/build image)
+docker/egress_proxy.py         trusted provider-only sidecar used for agent attempts
 docker/evaluator.Dockerfile    evaluator recipe; suite comes from a private build context
 tasks/htj2k/PROMPT.md          candidate-visible contract
 tasks/htj2k/seed/              codec, CLI, public benchmark and public fixtures
@@ -168,12 +180,14 @@ and repeated runs are maintainer release gates; see `AGENTS.md`.
 
 ## Trust model
 
-The agent container has network access for the model provider. A model could
-look up OpenJPH source online; the seed is already a port of it, so the gain is
-limited, but this is **capability evidence, not a security boundary**. Results
-record `network: open`; do not compare them directly with offline/local-model
-results. The hidden corpus is regenerated per run and expected pixels never
-enter the candidate process.
+The agent container has provider-only network access through an audited egress
+proxy. A model still could look up OpenJPH source online if that source were
+reachable through an approved provider or a user-approved endpoint; the seed is
+already a port of it, so the gain is limited, but this remains **capability
+evidence, not a security boundary**. Results record `network: open` for cloud
+models; do not compare them directly with offline/local-model results. The
+hidden corpus is regenerated per run and expected pixels never enter the
+candidate process.
 
 A public evaluator image is **scrape reduction, not secrecy**: anyone who can
 pull it can inspect its layers and recover the suite and the oracle. Keeping

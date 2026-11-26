@@ -32,7 +32,9 @@ on the local page.
 
 Only `eligible: true` runs with `gate_ok: true` and `perf_valid: true` should be
 treated as validated results. A self-reported run that fails a gate is not a
-codec result. One run is accepted, but `confidence: single-run` is noisy;
+codec result. Include `integrity_violation` from `score.json`; a true value makes
+`eligible` false while preserving the measured score for diagnostics. One run is
+accepted, but `confidence: single-run` is noisy;
 three runs with different seeds are recommended. Runs with an `agent_error`
 (provider quota/auth/rate limit) are ineligible and must not be submitted.
 A transient engine failure that the agent log shows the engine recovered from

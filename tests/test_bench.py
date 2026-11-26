@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -152,6 +155,20 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(score["perf_valid"])
         self.assertTrue(score["eligible"])
 
+    def test_integrity_violation_keeps_score_but_blocks_eligibility(self) -> None:
+        clean = self.score(decode_speedup=1.2, encode_speedup=1.2)
+        flagged = bench.score_run(
+            {"result": fake_results(self.manifest, decode_speedup=1.2, encode_speedup=1.2)},
+            self.build,
+            manifest=self.manifest,
+            result_valid=True,
+            integrity_violation=True,
+        )
+        self.assertTrue(clean["eligible"])
+        self.assertFalse(flagged["eligible"])
+        self.assertTrue(flagged["integrity_violation"])
+        self.assertAlmostEqual(flagged["score"], clean["score"], places=6)
+
     def test_target_scores_one_hundred(self) -> None:
         target_decode = float(self.manifest["targets"]["decode"])
         target_encode = float(self.manifest["targets"]["encode"])
@@ -232,10 +249,126 @@ class SubmissionTests(unittest.TestCase):
         }
         submission = bench.submission_from_score(meta)
         self.assertEqual(bench.validate_submission(submission), [])
+        meta["integrity_violation"] = True
+        flagged = bench.submission_from_score(meta)
+        self.assertFalse(flagged["eligible"])
+        self.assertTrue(flagged["integrity_violation"])
+        self.assertEqual(bench.validate_submission(flagged), [])
+        flagged["eligible"] = True
+        self.assertTrue(any("integrity" in error for error in bench.validate_submission(flagged)))
 
     def test_bad_submission(self) -> None:
         problems = bench.validate_submission({"schema": "nope"})
         self.assertTrue(problems)
+
+
+class AgentNetworkTests(unittest.TestCase):
+    def test_custom_provider_base_url_and_extra_auth_host_are_allowed(self) -> None:
+        info = {
+            "providers": {
+                "custom": {
+                    "settings": {"baseURL": "http://192.168.1.20:8080/v1"},
+                    "models": {"model": {}},
+                }
+            }
+        }
+        with mock.patch.object(bench, "load_config_info", return_value=info):
+            allowlist = bench.resolve_agent_allowlist(
+                "custom/model", Path("/config"), ["https://login.example.com/oauth"]
+            )
+        self.assertEqual(allowlist["192.168.1.20"], [8080])
+        self.assertEqual(allowlist["login.example.com"], [443])
+        self.assertNotIn("github.com", allowlist)
+
+    def test_evaluation_sources_cannot_be_approved_as_model_endpoints(self) -> None:
+        info = {
+            "providers": {
+                "custom": {
+                    "settings": {"baseURL": "http://192.168.1.20:8080/v1"},
+                    "models": {"model": {}},
+                }
+            }
+        }
+        with (
+            mock.patch.object(bench, "load_config_info", return_value=info),
+            self.assertRaisesRegex(SystemExit, "evaluation source"),
+        ):
+            bench.resolve_agent_allowlist("custom/model", Path("/config"), ["ghcr.io"])
+
+    def test_loopback_model_url_fails_with_host_guidance(self) -> None:
+        info = {
+            "providers": {
+                "local": {
+                    "settings": {"baseURL": "http://127.0.0.1:8080/v1"},
+                    "models": {"model": {}},
+                }
+            }
+        }
+        with (
+            mock.patch.object(bench, "load_config_info", return_value=info),
+            self.assertRaisesRegex(SystemExit, "host.docker.internal"),
+        ):
+            bench.resolve_agent_allowlist("local/model", Path("/config"), [])
+
+    def test_agent_dry_run_uses_internal_network_and_preserves_auth_forwarding(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for name in ("work", "data", "run", "config"):
+                (root / name).mkdir()
+            args = argparse.Namespace(
+                engine="docker",
+                agent_image="agent:test",
+                dry_run=True,
+                variant=None,
+                agent=None,
+                agent_cmd=None,
+                pure=False,
+                timeout=100,
+                idle_timeout=50,
+                cpu_set="0",
+                no_cpu_set=False,
+            )
+            output = io.StringIO()
+            with (
+                mock.patch.object(bench.subprocess, "Popen") as popen,
+                contextlib.redirect_stdout(output),
+            ):
+                result = bench.start_agent(
+                    "custom/model",
+                    root / "config",
+                    root / "work",
+                    root / "data",
+                    root / "run",
+                    env_names={"API_KEY", "HTTP_PROXY", "OPENCODE_CONFIG_CONTENT"},
+                    allowlist={"api.example.com": [443]},
+                    args=args,
+                )
+            popen.assert_not_called()
+        command = output.getvalue()
+        self.assertIn("network create --internal", command)
+        self.assertIn("HTTPS_PROXY=http://egress-proxy:8080", command)
+        self.assertIn("-e API_KEY", command)
+        self.assertNotIn("API_KEY=", command)
+        self.assertNotIn("-e HTTP_PROXY -e", command)
+        self.assertNotIn("-e OPENCODE_CONFIG_CONTENT -e", command)
+        self.assertIn("OPENCODE_CONFIG_CONTENT=", command)
+        self.assertFalse(result["integrity_violation"])
+
+    def test_egress_audit_separates_integrity_from_other_denials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            log = Path(temp) / "egress.log"
+            events = [
+                {"event": "allow", "host": "api.example.com", "port": 443},
+                {"event": "deny", "host": "example.com", "port": 443},
+                {"event": "deny", "host": "ghcr.io", "port": 443},
+                {"event": "deny", "host": "raw.githubusercontent.com", "port": 443},
+            ]
+            log.write_text("\n".join(json.dumps(event) for event in events) + "\n")
+            audit = bench.read_egress_audit(log)
+        self.assertEqual(audit["network_denied"], 3)
+        self.assertTrue(audit["integrity_violation"])
+        self.assertEqual(len(audit["integrity_reasons"]), 2)
+        self.assertNotIn("example.com", " ".join(audit["integrity_reasons"]))
 
 
 class HarnessTests(unittest.TestCase):

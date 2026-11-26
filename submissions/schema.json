@@ -57,6 +57,9 @@
     "eligible": {
       "type": "boolean"
     },
+    "integrity_violation": {
+      "type": "boolean"
+    },
     "gate_ok": {
       "type": "boolean"
     },

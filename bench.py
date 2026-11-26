@@ -31,6 +31,7 @@ import fcntl
 import hashlib
 import html
 import io
+import ipaddress
 import json
 import os
 import re
@@ -42,6 +43,7 @@ import subprocess
 import tarfile
 import sys
 import time
+import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
@@ -71,6 +73,42 @@ DEFAULT_ENGINE = os.environ.get("OPENCODE_BENCH_ENGINE", "docker")
 DEFAULT_CPU_SET = os.environ.get("OPENCODE_BENCH_CPUSET", "0")
 DEFAULT_NETWORK_POLICY = os.environ.get("OPENCODE_BENCH_NETWORK", "open")
 OPENCODE = os.environ.get("OPENCODE_BENCH_OPENCODE", "opencode")
+EGRESS_PROXY_PATH = ROOT / "docker" / "egress_proxy.py"
+OPENCODE_INFRA_ENDPOINTS = {
+    "models.dev": [443],
+    "models.opencode.ai": [443],
+    "registry.npmjs.org": [443],
+}
+SDK_ENDPOINTS = {
+    "@ai-sdk/anthropic": "https://api.anthropic.com",
+    "@ai-sdk/cerebras": "https://api.cerebras.ai",
+    "@ai-sdk/cohere": "https://api.cohere.com",
+    "@ai-sdk/deepinfra": "https://api.deepinfra.com",
+    "@ai-sdk/google": "https://generativelanguage.googleapis.com",
+    "@ai-sdk/groq": "https://api.groq.com",
+    "@ai-sdk/mistral": "https://api.mistral.ai",
+    "@ai-sdk/openai": "https://api.openai.com",
+    "@ai-sdk/xai": "https://api.x.ai",
+    "@openrouter/ai-sdk-provider": "https://openrouter.ai",
+}
+EVALUATION_SOURCE_SUFFIXES = (
+    "github.com",
+    "githubusercontent.com",
+    "ghcr.io",
+    "docker.com",
+    "docker.io",
+)
+PROTECTED_AGENT_ENV = {
+    "ALL_PROXY",
+    "HOME",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "NO_PROXY",
+    "OPENCODE_BENCH_MODEL",
+    "OPENCODE_BENCH_VARIANT",
+    "OPENCODE_CONFIG_CONTENT",
+    "XDG_CONFIG_HOME",
+}
 
 TEST_SCHEMA = "opencode-bench/htj2k-tests@1"
 MANIFEST_SCHEMA = "opencode-bench/htj2k-manifest@1"
@@ -195,6 +233,8 @@ CSV_FIELDS = [
     "result_valid",
     "perf_valid",
     "eligible",
+    "integrity_violation",
+    "network_denied",
     "score",
     "quality",
     "decode_speedup",
@@ -550,6 +590,153 @@ def config_env_names(config_dir: Path) -> set[str]:
     return names
 
 
+def parse_endpoint(value: str) -> tuple[str, int]:
+    text = value.strip()
+    if not text or "*" in text:
+        raise ValueError(f"invalid network endpoint {value!r}")
+    candidate = text if "://" in text else f"https://{text}"
+    parsed = urllib.parse.urlsplit(candidate)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(f"invalid network endpoint {value!r}")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("network endpoints must not contain credentials")
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(f"invalid network endpoint {value!r}") from exc
+    return parsed.hostname.rstrip(".").lower(), port
+
+
+def loopback_host(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost" or host.endswith(".localhost")
+
+
+def evaluation_source_host(host: str) -> bool:
+    return any(host == suffix or host.endswith(f".{suffix}") for suffix in EVALUATION_SOURCE_SUFFIXES)
+
+
+def add_endpoint(allowlist: dict[str, list[int]], value: str) -> None:
+    host, port = parse_endpoint(value)
+    ports = allowlist.setdefault(host, [])
+    if port not in ports:
+        ports.append(port)
+        ports.sort()
+
+
+def configured_base_urls(value: object) -> list[str]:
+    found: list[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key.lower() in ("baseurl", "api") and isinstance(item, str):
+                if item.startswith(("http://", "https://")):
+                    found.append(item)
+            elif isinstance(item, (dict, list)):
+                found.extend(configured_base_urls(item))
+    elif isinstance(value, list):
+        for item in value:
+            found.extend(configured_base_urls(item))
+    return found
+
+
+def load_models_dev(config_dir: Path) -> dict:
+    cache_dir: Path | None = None
+    try:
+        proc = subprocess.run(
+            [OPENCODE, "debug", "paths"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=config_env(config_dir),
+            check=False,
+        )
+        for line in proc.stdout.splitlines():
+            match = re.match(r"^cache\s+(.+)$", line.strip())
+            if match:
+                cache_dir = Path(match.group(1)).expanduser()
+                break
+        if cache_dir:
+            cached = cache_dir / "models.json"
+            if cached.exists():
+                data = json.loads(cached.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    return data
+        with urllib.request.urlopen("https://models.dev/api.json", timeout=10) as response:
+            data = json.load(response)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def resolve_agent_allowlist(
+    model: str, config_dir: Path, extra_endpoints: list[str]
+) -> dict[str, list[int]]:
+    """Build a per-run, fail-closed allowlist for the selected model provider."""
+    allowlist = {host: list(ports) for host, ports in OPENCODE_INFRA_ENDPOINTS.items()}
+    discovered: list[str] = []
+    info = load_config_info(config_dir)
+    providers = info.get("providers") or info.get("provider") or {}
+    provider_name, _, model_id = model.partition("/")
+    provider = providers.get(provider_name) or {}
+    if isinstance(provider, dict):
+        discovered.extend(configured_base_urls(provider))
+        selected = (provider.get("models") or {}).get(model_id) or {}
+        discovered.extend(configured_base_urls(selected))
+    if not discovered:
+        metadata = load_models_dev(config_dir).get(provider_name) or {}
+        if isinstance(metadata, dict):
+            api = metadata.get("api")
+            if isinstance(api, str) and api.startswith(("http://", "https://")):
+                discovered.append(api)
+            sdk_endpoint = SDK_ENDPOINTS.get(str(metadata.get("npm") or ""))
+            if sdk_endpoint:
+                discovered.append(sdk_endpoint)
+    for value in discovered:
+        try:
+            add_endpoint(allowlist, value)
+        except ValueError:
+            continue
+    for value in extra_endpoints:
+        try:
+            add_endpoint(allowlist, value)
+        except ValueError as exc:
+            raise SystemExit(f"error: --allow-host: {exc}") from exc
+    for host in allowlist:
+        if evaluation_source_host(host):
+            raise SystemExit(
+                f"error: network endpoint {host!r} is an evaluation source and "
+                "cannot be approved as a model endpoint"
+            )
+        if loopback_host(host):
+            raise SystemExit(
+                f"error: model endpoint {host!r} resolves inside the agent container. "
+                "Use a LAN address or host.docker.internal for a model server on the host."
+            )
+    approved = {
+        (host, port)
+        for host, ports in allowlist.items()
+        for port in ports
+        if host not in OPENCODE_INFRA_ENDPOINTS
+    }
+    if not approved:
+        raise SystemExit(
+            f"error: could not determine the API endpoint for {provider_name!r}; "
+            "pass --allow-host HOST[:PORT] or --allow-host http://192.168.1.10:8080/v1. "
+            "The agent network remains restricted; model authentication is unchanged."
+        )
+    return allowlist
+
+
+def format_allowlist(allowlist: dict[str, list[int]]) -> list[str]:
+    return [
+        f"{host}:{port}"
+        for host, ports in sorted(allowlist.items())
+        for port in sorted(ports)
+    ]
+
+
 def strip_jsonc(text: str) -> str:
     """Turn JSONC into JSON: drop comments and trailing commas."""
     out: list[str] = []
@@ -631,25 +818,32 @@ def prepare_agent_config(config_dir: Path, run_dir: Path) -> Path:
     return target
 
 
-def load_model_entry(model: str) -> dict | None:
+def load_config_info(config_dir: Path | None = None) -> dict:
+    """Return effective OpenCode config without printing its secret values."""
     try:
         proc = subprocess.run(
             [OPENCODE, "debug", "config", "--standalone"],
             capture_output=True,
             text=True,
             timeout=15,
+            env=config_env(config_dir),
             check=False,
         )
         sources = json.loads(proc.stdout)
         info: dict = {}
         for source in sources:
-            if isinstance(source.get("info"), dict):
+            if isinstance(source, dict) and isinstance(source.get("info"), dict):
                 info.update(source["info"])
-        providers = info.get("providers") or info.get("provider") or {}
-        provider, _, model_id = model.partition("/")
-        return (providers.get(provider) or {}).get("models", {}).get(model_id)
+        return info
     except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
-        return None
+        return {}
+
+
+def load_model_entry(model: str, config_dir: Path | None = None) -> dict | None:
+    info = load_config_info(config_dir)
+    providers = info.get("providers") or info.get("provider") or {}
+    provider, _, model_id = model.partition("/")
+    return (providers.get(provider) or {}).get("models", {}).get(model_id)
 
 
 def describe_variant(entry: dict, variant: str | None) -> tuple[str, str]:
@@ -674,13 +868,17 @@ def describe_variant(entry: dict, variant: str | None) -> tuple[str, str]:
     return "unknown", ""
 
 
-def model_thinking(model: str, variant: str | None) -> tuple[str, str]:
-    entry = load_model_entry(model)
+def model_thinking(
+    model: str, variant: str | None, config_dir: Path | None = None
+) -> tuple[str, str]:
+    entry = load_model_entry(model, config_dir)
     return describe_variant(entry, variant) if entry else ("unknown", "")
 
 
-def model_variants(model: str) -> list[tuple[str, str, str]]:
-    entry = load_model_entry(model)
+def model_variants(
+    model: str, config_dir: Path | None = None
+) -> list[tuple[str, str, str]]:
+    entry = load_model_entry(model, config_dir)
     if not entry:
         return []
     out: list[tuple[str, str, str]] = []
@@ -704,9 +902,11 @@ def variant_rank(variant_id: str, thinking: str, effort: str) -> int:
     return -1
 
 
-def ordered_variants(model: str) -> list[tuple[str, str, str]]:
+def ordered_variants(
+    model: str, config_dir: Path | None = None
+) -> list[tuple[str, str, str]]:
     return sorted(
-        model_variants(model),
+        model_variants(model, config_dir),
         key=lambda item: (-variant_rank(item[0], item[1], item[2]), item[0]),
     )
 
@@ -892,6 +1092,158 @@ def provider_retry_delay(agent: dict, attempts: list[dict], args: argparse.Names
     return min(base * (2**exponent), 15 * 60.0)
 
 
+def start_egress_proxy(
+    engine: str,
+    agent_image: str,
+    run_dir: Path,
+    allowlist: dict[str, list[int]],
+    dry_run: bool,
+) -> dict:
+    suffix = uuid.uuid4().hex[:8]
+    proxy = f"opencode-bench-htj2k-egress-{suffix}"
+    network = f"opencode-bench-htj2k-internal-{suffix}"
+    policy_path = run_dir / f"egress-allowlist-{suffix}.json"
+    policy_path.write_text(json.dumps(allowlist, indent=2) + "\n", encoding="utf-8")
+    info = {
+        "proxy": proxy,
+        "network": network,
+        "policy_path": policy_path,
+        "log_path": run_dir / f"egress-{suffix}.log",
+        "dry_run": dry_run,
+    }
+    create = [engine, "network", "create", "--internal", network]
+    launch = [
+        engine,
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        proxy,
+        "--add-host",
+        "host.docker.internal:host-gateway",
+        "-v",
+        f"{policy_path}:/run/egress-allowlist.json:ro",
+        "-v",
+        f"{EGRESS_PROXY_PATH}:/opt/opencode-bench/egress_proxy.py:ro",
+        "--entrypoint",
+        "python3",
+        agent_image,
+        "/opt/opencode-bench/egress_proxy.py",
+        "--port",
+        "8080",
+        "--allowlist",
+        "/run/egress-allowlist.json",
+    ]
+    connect = [engine, "network", "connect", "--alias", "egress-proxy", network, proxy]
+    if dry_run:
+        for command in (create, launch, connect):
+            print("+ " + " ".join(shlex.quote(part) for part in command))
+        return info
+    try:
+        for command in (create, launch, connect):
+            proc = subprocess.run(command, capture_output=True, text=True, check=False)
+            if proc.returncode != 0:
+                raise RuntimeError(proc.stderr.strip() or f"command failed: {command[1]}")
+        ready = False
+        for _ in range(50):
+            probe = subprocess.run(
+                [
+                    engine,
+                    "exec",
+                    proxy,
+                    "python3",
+                    "-c",
+                    "import socket; socket.create_connection(('127.0.0.1', 8080), 1).close()",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if probe.returncode == 0:
+                ready = True
+                break
+            time.sleep(0.1)
+        if not ready:
+            raise RuntimeError("egress proxy did not become ready")
+        return info
+    except Exception:
+        stop_egress_proxy(engine, info)
+        raise
+
+
+def read_egress_audit(path: Path) -> dict:
+    denied: set[str] = set()
+    integrity_reasons: set[str] = set()
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        lines = []
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict) or event.get("event") != "deny":
+            continue
+        host = str(event.get("host") or "").lower()
+        port = event.get("port")
+        destination = f"{host}:{port}" if host else "unknown"
+        denied.add(destination)
+        if evaluation_source_host(host):
+            integrity_reasons.add(f"blocked evaluation-source access to {destination}")
+    return {
+        "network_denied": len(denied),
+        "network_denied_hosts": sorted(denied),
+        "integrity_violation": bool(integrity_reasons),
+        "integrity_reasons": sorted(integrity_reasons),
+    }
+
+
+def stop_egress_proxy(engine: str, info: dict) -> dict:
+    if info.get("dry_run"):
+        for command in (
+            [engine, "rm", "-f", info["proxy"]],
+            [engine, "network", "rm", info["network"]],
+        ):
+            print("+ " + " ".join(shlex.quote(part) for part in command))
+        return read_egress_audit(info["log_path"])
+    logs = subprocess.run(
+        [engine, "logs", info["proxy"]], capture_output=True, text=True, check=False
+    )
+    info["log_path"].write_text(logs.stdout + logs.stderr, encoding="utf-8")
+    subprocess.run(
+        [engine, "rm", "-f", info["proxy"]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    subprocess.run(
+        [engine, "network", "rm", info["network"]],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return read_egress_audit(info["log_path"])
+
+
+def combine_network_audits(items: list[dict]) -> dict:
+    """Aggregate per-attempt/per-round egress audits without losing evidence."""
+    denied = 0
+    hosts: set[str] = set()
+    reasons: set[str] = set()
+    for item in items:
+        audit = item.get("network_integrity", item) if isinstance(item, dict) else {}
+        denied += int(audit.get("network_denied") or 0)
+        hosts.update(str(host) for host in audit.get("network_denied_hosts") or [])
+        reasons.update(str(reason) for reason in audit.get("integrity_reasons") or [])
+    return {
+        "network_denied": denied,
+        "network_denied_hosts": sorted(hosts),
+        "integrity_violation": bool(reasons),
+        "integrity_reasons": sorted(reasons),
+    }
+
+
 def start_agent(
     model: str,
     config_dir: Path,
@@ -900,6 +1252,7 @@ def start_agent(
     run_dir: Path,
     *,
     env_names: set[str],
+    allowlist: dict[str, list[int]],
     args: argparse.Namespace,
     round_number: int = 1,
     prompt_file: Path | None = None,
@@ -910,6 +1263,7 @@ def start_agent(
     log_suffix: str = "",
     watch_completion: bool = True,
 ) -> dict:
+    egress = start_egress_proxy(args.engine, args.agent_image, run_dir, allowlist, args.dry_run)
     name = f"opencode-bench-htj2k-{slug(provider_of(model))}-{uuid.uuid4().hex[:8]}"
     log_path = run_dir / f"agent-round-{round_number}{log_suffix}.log"
     command = [
@@ -918,6 +1272,8 @@ def start_agent(
         "--rm",
         "--name",
         name,
+        "--network",
+        egress["network"],
         "--shm-size=1g",
         *cpu_set_flags(args),
         "-v",
@@ -932,10 +1288,28 @@ def start_agent(
         "XDG_CONFIG_HOME=/home/agent/.config",
         "-e",
         f"OPENCODE_BENCH_MODEL={model}",
+        "-e",
+        "HTTP_PROXY=http://egress-proxy:8080",
+        "-e",
+        "HTTPS_PROXY=http://egress-proxy:8080",
+        "-e",
+        "ALL_PROXY=http://egress-proxy:8080",
+        "-e",
+        "http_proxy=http://egress-proxy:8080",
+        "-e",
+        "https_proxy=http://egress-proxy:8080",
+        "-e",
+        "NO_PROXY=localhost,127.0.0.1,::1",
+        "-e",
+        "no_proxy=localhost,127.0.0.1,::1",
+        "-e",
+        'OPENCODE_CONFIG_CONTENT={"permission":{"webfetch":"deny","websearch":"deny"},"websearch":false}',
     ]
     if args.variant:
         command += ["-e", f"OPENCODE_BENCH_VARIANT={args.variant}"]
     for key in sorted(env_names):
+        if key.upper() in PROTECTED_AGENT_ENV:
+            continue
         command += ["-e", key]
     command += [
         "-w",
@@ -953,6 +1327,7 @@ def start_agent(
     ]
     if args.dry_run:
         print("+ " + " ".join(shlex.quote(part) for part in command))
+        audit = stop_egress_proxy(args.engine, egress)
         return {
             "wall_s": 0.0,
             "watchdog": "dry-run",
@@ -965,86 +1340,92 @@ def start_agent(
             "provider_recovered": False,
             "provider_terminal": False,
             "provider_retryable": False,
+            **audit,
         }
 
-    start = time.time()
-    round_timeout = float(timeout_s if timeout_s is not None else args.timeout)
-    round_idle = float(idle_timeout_s if idle_timeout_s is not None else args.idle_timeout)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as handle:
-        handle.write("+ " + " ".join(shlex.quote(part) for part in command) + "\n\n")
-        handle.flush()
-        proc = subprocess.Popen(
-            command,
-            stdout=handle,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        completion_path = workdir / "COMPLETION.md"
-        last_size = 0
-        last_change = start
-        completion_seen_at: float | None = None
-        watchdog = "exit"
-        while proc.poll() is None:
-            now = time.time()
-            try:
-                size = log_path.stat().st_size
-            except FileNotFoundError:
-                size = 0
-            if size != last_size:
-                last_size = size
-                last_change = now
-            if watch_completion and completion_path.exists() and completion_seen_at is None:
-                completion_seen_at = now
-                print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
-            if completion_seen_at is not None and now - completion_seen_at > 60:
-                watchdog = "completion"
-                break
-            if now - start > round_timeout:
-                watchdog = "hard"
-                break
-            if now - last_change > round_idle:
-                watchdog = "idle"
-                break
-            time.sleep(2)
-        if watchdog != "exit":
-            subprocess.run(
-                [args.engine, "rm", "-f", name],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
+    try:
+        start = time.time()
+        round_timeout = float(timeout_s if timeout_s is not None else args.timeout)
+        round_idle = float(idle_timeout_s if idle_timeout_s is not None else args.idle_timeout)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("w", encoding="utf-8") as handle:
+            handle.write("+ " + " ".join(shlex.quote(part) for part in command) + "\n\n")
+            handle.flush()
+            proc = subprocess.Popen(
+                command,
+                stdout=handle,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
             )
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+            completion_path = workdir / "COMPLETION.md"
+            last_size = 0
+            last_change = start
+            completion_seen_at: float | None = None
+            watchdog = "exit"
+            while proc.poll() is None:
+                now = time.time()
+                try:
+                    size = log_path.stat().st_size
+                except FileNotFoundError:
+                    size = 0
+                if size != last_size:
+                    last_size = size
+                    last_change = now
+                if watch_completion and completion_path.exists() and completion_seen_at is None:
+                    completion_seen_at = now
+                    print("  COMPLETION.md seen; stopping in 60s unless the agent exits")
+                if completion_seen_at is not None and now - completion_seen_at > 60:
+                    watchdog = "completion"
+                    break
+                if now - start > round_timeout:
+                    watchdog = "hard"
+                    break
+                if now - last_change > round_idle:
+                    watchdog = "idle"
+                    break
+                time.sleep(2)
+            if watchdog != "exit":
+                subprocess.run(
+                    [args.engine, "rm", "-f", name],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
 
-    wall_s = time.time() - start
-    log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    self_tests = len(SELF_TEST_RE.findall(log_text))
-    session_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', log_text)
-    provider = analyze_provider_errors(log_path)
-    provider_error = provider["last_error"]
-    # OpenCode exits non-zero when the provider errored, even if it retried in
-    # place and finished the step. Progress after the failure is the signal
-    # that matters, not the process exit code.
-    agent_ok = provider_error is None and (proc.returncode == 0 or provider["recovered"])
-    return {
-        "wall_s": wall_s,
-        "watchdog": watchdog,
-        "completion": (workdir / "COMPLETION.md").exists(),
-        "agent_ok": agent_ok,
-        "agent_exit_code": proc.returncode,
-        "self_test_runs": self_tests,
-        "session_id": session_match.group(1) if session_match else None,
-        "log_path": str(log_path),
-        "provider_error": provider_error,
-        "provider_errors": provider["events"],
-        "provider_recovered": provider["recovered"],
-        "provider_terminal": provider["terminal"],
-        "provider_retryable": provider["retryable"],
-    }
+        wall_s = time.time() - start
+        log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+        self_tests = len(SELF_TEST_RE.findall(log_text))
+        session_match = re.search(r'"sessionID"\s*:\s*"([^"]+)"', log_text)
+        provider = analyze_provider_errors(log_path)
+        provider_error = provider["last_error"]
+        # OpenCode exits non-zero when the provider errored, even if it retried in
+        # place and finished the step. Progress after the failure is the signal
+        # that matters, not the process exit code.
+        agent_ok = provider_error is None and (proc.returncode == 0 or provider["recovered"])
+        result = {
+            "wall_s": wall_s,
+            "watchdog": watchdog,
+            "completion": (workdir / "COMPLETION.md").exists(),
+            "agent_ok": agent_ok,
+            "agent_exit_code": proc.returncode,
+            "self_test_runs": self_tests,
+            "session_id": session_match.group(1) if session_match else None,
+            "log_path": str(log_path),
+            "provider_error": provider_error,
+            "provider_errors": provider["events"],
+            "provider_recovered": provider["recovered"],
+            "provider_terminal": provider["terminal"],
+            "provider_retryable": provider["retryable"],
+        }
+    finally:
+        audit = stop_egress_proxy(args.engine, egress)
+    result.update(audit)
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -1706,6 +2087,7 @@ def score_run(
     *,
     manifest: dict,
     result_valid: bool,
+    integrity_violation: bool = False,
 ) -> dict:
     data = tests.get("result") or {}
     families = (data.get("correctness") or {}).get("families") or {}
@@ -1775,8 +2157,9 @@ def score_run(
         and bool(result_valid)
         and gates_ok
         and perf_valid
+        and not integrity_violation
     )
-    if not eligible:
+    if not eligible and not integrity_violation:
         score = 0.0
     if not gates_ok or not perf_valid:
         score = 0.0
@@ -1796,6 +2179,7 @@ def score_run(
         "quality": min(1.0, score / 100.0),
         "score": score,
         "eligible": eligible,
+        "integrity_violation": bool(integrity_violation),
         "fatal": failures,
         "major": 0 if perf_valid else 1,
         "minor": 0,
@@ -1831,7 +2215,15 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         f"- provider: {meta['provider']}",
         *([f"- hardware: {meta['hardware']}"] if meta.get("hardware") else []),
         f"- cpu: {meta.get('cpu_set')} (effective {meta.get('cpu_count')})",
-        f"- network: {meta.get('network_policy')} (grader is always offline)",
+        f"- network: {meta.get('network_policy')} (provider-only egress; grader is always offline)",
+        f"- integrity violation: {bool(meta.get('integrity_violation'))}",
+        f"- blocked network destinations: {meta.get('network_denied', 0)}",
+        *(
+            ["", "### Integrity evidence", ""]
+            + [f"- {reason}" for reason in meta.get("integrity_reasons", [])]
+            if meta.get("integrity_violation")
+            else []
+        ),
         f"- rounds: {meta.get('rounds_count')} ({meta.get('round_plan')}); best {meta.get('best_round')}",
         f"- variant: {meta.get('variant', 'default')}",
         f"- thinking: {meta.get('thinking', 'unknown')}"
@@ -2019,7 +2411,12 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
         if not row.get("run_id"):
             continue
         score = score_row(row)
-        eligible = str(row.get("eligible", "")).lower() == "true"
+        integrity_violation = row.get("integrity_violation") is True or str(
+            row.get("integrity_violation", "")
+        ).lower() == "true"
+        eligible = (
+            str(row.get("eligible", "")).lower() == "true" and not integrity_violation
+        )
         if not eligible:
             score *= LEADERBOARD_INELIGIBLE_FACTOR
         entries.append(
@@ -2480,6 +2877,8 @@ def print_summary(meta: dict, score: dict) -> None:
         f"   encode x{score['encode_speedup']:.3f}"
         f"   {'ELIGIBLE' if score['eligible'] else 'not eligible'}"
     )
+    if meta.get("integrity_violation"):
+        print("  network INTEGRITY VIOLATION — run ineligible; score retained for diagnostics")
     rounds = meta.get("rounds") or []
     if rounds:
         print(
@@ -2863,7 +3262,8 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 "run ./bench.py models or pass --no-preflight"
             )
 
-    thinking, effort = model_thinking(model, variant)
+    thinking, effort = model_thinking(model, variant, config_dir)
+    allowlist = resolve_agent_allowlist(model, config_dir, args.allow_host)
     variant_label = variant or "default"
     for image, agent in ((args.agent_image, True), (args.test_image, False)):
         if not ensure_image(args.engine, image, dry_run=args.dry_run):
@@ -2882,6 +3282,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     print(f"  config  {config_dir}")
     print(f"  thinking {thinking}" + (f" ({effort})" if effort else "") + f"  variant={variant_label}")
     print(f"  cpu     {args.cpu_set if not args.no_cpu_set else 'unpinned'}  network={args.network_policy}")
+    print(f"  egress  provider-only ({', '.join(format_allowlist(allowlist))})")
     print(f"  rounds  {' / '.join(f'{value:g}m' for value in plan)}")
 
     rounds: list[dict] = []
@@ -2957,6 +3358,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                     data_dir,
                     run_dir,
                     env_names=env_names,
+                    allowlist=allowlist,
                     args=args,
                     round_number=round_number,
                     prompt_file=prompt,
@@ -3018,6 +3420,9 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             break
         session_id = session_id or attempts[-1].get("session_id")
         agent = attempts[-1]
+        network_integrity = combine_network_audits(attempts)
+        if network_integrity["integrity_violation"]:
+            print("  network integrity violation — see egress logs; run will be ineligible")
         log_path = Path(agent.get("log_path") or (run_dir / f"agent-round-{round_number}.log"))
         metrics = combine_attempt_metrics(attempts)
         steps = sum(count_log_steps(Path(item.get("log_path") or log_path)) for item in attempts)
@@ -3063,6 +3468,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             build,
             manifest=manifest,
             result_valid=tests.get("result_valid", False),
+            integrity_violation=network_integrity["integrity_violation"],
         )
         if integrity["problems"]:
             score["eligible"] = False
@@ -3091,6 +3497,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
                 "metrics": metrics,
                 "steps": steps,
                 "integrity": integrity,
+                "network_integrity": network_integrity,
                 "build": build,
                 "tests": tests,
                 "score": score,
@@ -3160,6 +3567,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             row["build"],
             manifest=manifest,
             result_valid=final_tests.get("result_valid", False),
+            integrity_violation=row.get("network_integrity", {}).get("integrity_violation", False),
         )
         if row.get("integrity", {}).get("problems"):
             final_score["eligible"] = False
@@ -3216,6 +3624,7 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     recovered_provider_errors = [event for event in provider_events if event.get("recovered")]
     provider_retries = sum(int(row.get("provider_retries") or 0) for row in rounds)
     final_environment = (chosen_tests.get("result") or {}).get("environment") or {}
+    network_integrity = combine_network_audits(rounds)
     final_score = dict(chosen_final) if chosen_final else {}
     if agent_error:
         final_score["eligible"] = False
@@ -3225,6 +3634,9 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
             if row.get("final"):
                 row["final"]["score"]["eligible"] = False
                 row["final"]["score"]["score"] = 0.0
+    if network_integrity["integrity_violation"]:
+        final_score["eligible"] = False
+        final_score["integrity_violation"] = True
     final_build = {
         "build_ok": bool(chosen_build.get("build_ok")),
         "seed_build_ok": bool(chosen_build.get("seed_build_ok")),
@@ -3295,6 +3707,11 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "gate_ok": bool(final_score.get("gate_ok")),
         "perf_valid": bool(final_score.get("perf_valid")),
         "eligible": bool(final_score.get("eligible")),
+        "integrity_violation": bool(network_integrity["integrity_violation"]),
+        "integrity_reasons": network_integrity["integrity_reasons"],
+        "network_denied": network_integrity["network_denied"],
+        "network_denied_hosts": network_integrity["network_denied_hosts"],
+        "network_allowed_hosts": format_allowlist(allowlist),
         "score": float(final_score.get("score") or 0.0),
         "quality": float(final_score.get("quality") or 0.0),
         "decode_speedup": float(final_score.get("decode_speedup") or 0.0),
@@ -3497,6 +3914,8 @@ def cmd_check(args: argparse.Namespace) -> int:
         problems.append("missing docker/agent.Dockerfile")
     if not (ROOT / "docker" / "evaluator.Dockerfile").exists():
         problems.append("missing docker/evaluator.Dockerfile")
+    if not EGRESS_PROXY_PATH.exists():
+        problems.append("missing docker/egress_proxy.py")
     if not (SEED_DIR / "Cargo.lock").exists():
         problems.append("missing seed Cargo.lock")
     if not (SEED_DIR / "vendor").exists():
@@ -3648,7 +4067,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     )
     print(
         f"  cpu-set {args.cpu_set if not args.no_cpu_set else 'unpinned'} · "
-        f"agent network {args.network_policy} · grader network none"
+        f"agent network {args.network_policy} · provider-only egress · grader network none"
     )
     return 0
 
@@ -3875,6 +4294,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         build,
         manifest=manifest,
         result_valid=tests.get("result_valid", False),
+        integrity_violation=bool(meta.get("integrity_violation")),
     )
     if meta.get("agent_error"):
         score["eligible"] = False
@@ -4071,7 +4491,8 @@ def submission_from_score(meta: dict) -> dict:
         "provider_retries": meta.get("provider_retries"),
         "provider_retry_after_s": meta.get("provider_retry_after_s"),
         "score": round(float(meta.get("score") or 0.0), 2),
-        "eligible": eligible,
+        "eligible": eligible and not bool(meta.get("integrity_violation")),
+        "integrity_violation": bool(meta.get("integrity_violation")),
         "gate_ok": bool(meta.get("gate_ok")),
         "perf_valid": bool(meta.get("perf_valid")),
         "decode_speedup": meta.get("decode_speedup"),
@@ -4110,6 +4531,12 @@ def validate_submission(data: object) -> list[str]:
         problems.append("network_policy must be 'open' or 'offline'")
     if data.get("agent_error") and data.get("eligible"):
         problems.append("a run with an agent/provider error cannot be eligible")
+    if data.get("integrity_violation") is not None and not isinstance(
+        data.get("integrity_violation"), bool
+    ):
+        problems.append("integrity_violation must be boolean when present")
+    elif data.get("integrity_violation") and data.get("eligible"):
+        problems.append("a run with an integrity violation cannot be eligible")
     try:
         score = float(data.get("score") or 0)
     except (TypeError, ValueError):
@@ -4243,6 +4670,7 @@ def cmd_site(args: argparse.Namespace) -> int:
             "decode_speedup": data.get("decode_speedup"),
             "encode_speedup": data.get("encode_speedup"),
             "eligible": data.get("eligible"),
+            "integrity_violation": data.get("integrity_violation"),
             "gate_ok": data.get("gate_ok"),
             "perf_valid": data.get("perf_valid"),
             "network_policy": data.get("network_policy"),
@@ -4303,7 +4731,7 @@ def build_parser() -> argparse.ArgumentParser:
                         help="disable CPU pinning (debugging only)")
     parser.add_argument("--network-policy", default=DEFAULT_NETWORK_POLICY,
                         choices=("open", "offline"),
-                        help="agent network policy label; grading is always offline")
+                        help="agent network policy label; provider-only egress is enforced and grading is always offline")
     parser.add_argument("--dry-run", action="store_true")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -4383,6 +4811,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "(median per-workload speedup; 1 disables)")
     p.add_argument("--hardware", default="")
     p.add_argument("--env", action="append", default=[])
+    p.add_argument(
+        "--allow-host",
+        action="append",
+        default=[],
+        metavar="HOST[:PORT]|URL",
+        help=(
+            "allow an additional model API/authentication endpoint; repeatable. "
+            "Does not disable provider-only egress enforcement"
+        ),
+    )
     p.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS)
     p.set_defaults(func=cmd_run)
 

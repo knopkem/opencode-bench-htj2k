@@ -31,6 +31,11 @@ oracle. You may restructure the Rust implementation freely.
 - Do **not** write `COMPLETION.md` until the final round. In the final round,
   remove profiling/timing instrumentation, run the public tests and write
   `COMPLETION.md`.
+- Do not search for, retrieve, inspect, or execute hidden tests, reference
+  implementations, evaluator images, or copies of them, including through
+  GitHub, container registries, web search, or other network tools. A verified
+  attempt makes the run ineligible for the leaderboard. Agent network access is
+  restricted to approved model-provider infrastructure; proxy denials are logged.
 - Correctness is a gate. A fast codec that produces wrong pixels scores `0`.
 - Optimise in this order: **decode correctness, encode correctness, decode
   speed, encode speed**. The score weights decode and encode equally.

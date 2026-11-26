@@ -17,7 +17,13 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
 - `tests/oracle/` (in the private repository) holds pinned OpenJPH source and
   the independent oracle harness. Never bake it into the agent image.
 - `docker/agent.Dockerfile` builds the public agent/build image;
-  `docker/evaluator.Dockerfile` is the evaluator recipe that consumes the
+  `docker/egress_proxy.py` is bind-mounted into a separate trusted sidecar for
+  every agent attempt. The agent has an internal-only network, while the
+  sidecar allows exact provider/OpenCode host+port endpoints without
+  terminating TLS. Do not replace this with proxy environment variables alone
+  or a blanket `--network none`; the former is bypassable and the latter breaks
+  authenticated cloud and LAN model providers.
+- `docker/evaluator.Dockerfile` is the evaluator recipe that consumes the
   private suite through a named `tests` build context.
 - `.github/workflows/community-leaderboard.yml` validates
   `benchmark-result` issues, moderates invalid submissions, and rebuilds the
@@ -142,8 +148,10 @@ Requirements:
   the runner reports both separately.
 - A thread-based speedup measured outside the cpuset is not a result. The
   grader exposes one CPU; check `nproc` before trusting an A/B number.
-- Network is labelled `open` for cloud models. Do not mix open-network and
-  offline results in the same ranking.
+- Network is labelled `open` for cloud models. Agent egress is enforced
+  per selected provider via the sidecar; `--allow-host` is only for auxiliary
+  model/authentication endpoints and cannot approve evaluation sources. Do not
+  mix open-network and offline results in the same ranking.
 - Provider quota/rate-limit errors are not model failures. Stop at the first
   terminal (`401`/`403`/`429`, quota, auth) error, keep the checkpoint, mark the
   run `agent_error` and ineligible, and never submit it. Do not spend later

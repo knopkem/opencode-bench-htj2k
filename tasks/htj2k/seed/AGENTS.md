@@ -71,6 +71,9 @@ htj2k decode IN.j2c OUT.raw
   `include_str!`). `Cargo.lock` is checked against an allowlist.
 - Do not try to read the hidden corpus or the grading oracle. The candidate
   process runs as an unprivileged user and the oracle directory is unreadable.
+- Do not search for hidden tests, reference implementations, or evaluator
+  images over any network/tool. Accessing evaluation sources is an integrity
+  violation, not a workaround for files that are not in this container.
 - Correctness is a gate. A faster codec that changes pixels scores zero.
 
 ## Known seed limitations

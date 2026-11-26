@@ -21,6 +21,17 @@ vendored `vendor/` tree. If the agent added a dependency the build fails by
 design. The hidden suite also rejects `build.rs`, git dependencies and packages
 outside the allowlist.
 
+## A model provider is unreachable
+
+Every agent attempt runs on an internal-only Docker network and reaches the model
+provider through a trusted egress sidecar. TLS is not intercepted, so cloud API
+keys continue to work. Custom provider `baseURL` values are allowlisted
+automatically; additional authentication/API endpoints need a repeatable
+`--allow-host HOST[:PORT]` option. Use `host.docker.internal` or a LAN address
+for a model server on the host; `127.0.0.1` refers to the agent container and is
+rejected before the run starts. Proxy denials are written to `egress-*.log`;
+attempts to reach evaluation sources make the run ineligible.
+
 ## `rescore` says the seed build failed
 
 The evaluator image runs both the candidate workdir build and the pristine

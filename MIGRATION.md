@@ -182,10 +182,13 @@ still receive no agent credentials and must not mount the agent workdir
 read-write.
 
 Image separation prevents accidental local filesystem discovery by the agent.
-It does not prevent an agent from retrieving a public evaluator image over a
-network. If runtime retrieval becomes a concern, keep the evaluator package
-private or add network egress restrictions that allow only required
-model/provider endpoints.
+Runtime retrieval is additionally restricted by an internal-only agent network
+and a separate non-TLS-terminating egress proxy. The proxy allows only the
+selected model provider and required OpenCode infrastructure, so authenticated
+cloud and LAN providers continue to work; custom auxiliary endpoints require an
+explicit `--allow-host`. This does not make a public evaluator image confidential
+to a determined person outside the sandbox. Keep the evaluator package private
+or use trusted remote scoring when that stronger guarantee is required.
 
 ## 4. Harness changes
 
