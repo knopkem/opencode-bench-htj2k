@@ -74,6 +74,11 @@ Maintainer invariants for **opencode-bench-htj2k**. The agent-visible contract i
   shared, so min-of-N can put a faster candidate below the seed; it is kept as
   a diagnostic only. The held-out final grading is repeated twice and combined
   as the median per workload.
+- Leaderboard effort and token fields are read from `opencode-data/opencode.db`
+  and the agent logs and are **informational only**. They must never affect the
+  score, quality, gates or eligibility, and `./bench.py backfill` may rebuild
+  them from saved run artifacts. Old community submissions without those
+  fields stay valid on the additive `htj2k-result@1` schema.
 
 ## Validation gates
 

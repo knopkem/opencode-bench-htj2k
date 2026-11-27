@@ -134,7 +134,7 @@ REASONING_ORDER = {
 }
 
 SELF_TEST_RE = re.compile(
-    r"(?:cargo\s+(?:build|test|bench|clippy|check)|scripts/bench\.py|python3?\s+scripts/bench\.py)",
+    r"(?:cargo\s+(?:test|bench)|scripts/bench\.py|python3?\s+scripts/bench\.py)",
     re.IGNORECASE,
 )
 BUILD_TOOL_RE = re.compile(r"cargo\s+(?:build|check|clippy)", re.IGNORECASE)
@@ -182,21 +182,39 @@ EFFORT_FIELDS = [
     "tool_other_s",
     "self_test_s",
     "self_test_runs",
+    "self_test_failures",
     "build_tool_s",
     "wall_ex_self_test_s",
+    "self_test_share",
     "retries",
+    "retry_s",
+    "step_median_s",
+    "step_p90_s",
+    "step_max_s",
     "input_tokens",
     "output_tokens",
     "reasoning_tokens",
     "cache_read_tokens",
     "cache_write_tokens",
+    "compaction_tokens",
     "total_tokens",
     "max_request_tokens",
     "mean_request_tokens",
+    "cost_usd",
+    "cost_known",
+    "think_share",
+    "output_share",
+    "tool_share",
+    "ttft_share",
+    "other_share",
     "gen_tokens_per_s",
+    "gen_tokens_per_s_median",
+    "tokens_per_step",
+    "cache_hit_rate",
     "metrics_source",
     "metrics_version",
 ]
+METRICS_VERSION = 2
 CSV_FIELDS = [
     "run_id",
     "timestamp",
@@ -230,6 +248,8 @@ CSV_FIELDS = [
     "build_ok",
     "seed_build_ok",
     "gate_ok",
+    "gate_pass",
+    "gate_total",
     "result_valid",
     "perf_valid",
     "eligible",
@@ -301,6 +321,41 @@ def format_tokens(value: object) -> str:
     if number >= 1000:
         return f"{number / 1000:.1f}k"
     return str(number)
+
+
+def format_optional_duration(seconds: object) -> str:
+    if seconds is None or seconds == "":
+        return "—"
+    try:
+        return format_duration(float(seconds))
+    except (TypeError, ValueError):
+        return "—"
+
+
+def format_percent(value: object) -> str:
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value) * 100:.0f}%"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    weight = position - lower
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * weight
+
+
+def median_or_none(values: list[float]) -> float | None:
+    return statistics.median(values) if values else None
 
 
 def atomic_write_text(path: Path, text: str) -> None:
@@ -1449,7 +1504,13 @@ def count_compactions(data_dir: Path) -> int:
 
 
 def read_agent_usage(log_path: Path, wall_s: float) -> dict:
+    """Token usage and step timings from an `opencode run --format json` log.
+
+    The log carries token totals and per-step durations. It has no per-block
+    timings, so the effort split comes from :func:`read_session_metrics`.
+    """
     metrics = {
+        "available": False,
         "span_s": wall_s,
         "agent_s": wall_s,
         "ttft_s": 0.0,
@@ -1464,27 +1525,41 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
         "tool_other_s": 0.0,
         "self_test_s": 0.0,
         "self_test_runs": 0,
+        "self_test_failures": 0,
         "build_tool_s": 0.0,
         "wall_ex_self_test_s": wall_s,
         "retries": 0,
+        "retry_s": 0.0,
+        "steps": 0,
+        "step_median_s": None,
+        "step_p90_s": None,
+        "step_max_s": None,
         "input_tokens": 0,
         "output_tokens": 0,
         "reasoning_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "compaction_tokens": 0,
         "total_tokens": 0,
         "max_request_tokens": 0,
         "mean_request_tokens": 0,
+        "cost_usd": 0.0,
+        "cost_known": False,
         "gen_tokens_per_s": None,
+        "gen_tokens_per_s_median": None,
+        "tokens_per_step": None,
+        "cache_hit_rate": None,
         "metrics_source": "log",
-        "metrics_version": 1,
+        "metrics_version": METRICS_VERSION,
     }
     if not log_path.is_file():
         return metrics
+    metrics["available"] = True
     step_starts: dict[str, int] = {}
     steps = 0
+    durations: list[float] = []
+    step_rates: list[float] = []
     request_tokens: list[int] = []
-    self_test_s = 0.0
     with log_path.open(encoding="utf-8", errors="replace") as handle:
         for line in handle:
             line = line.strip()
@@ -1493,6 +1568,8 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
                 continue
             kind = event.get("type")
             part = event.get("part") or {}
@@ -1507,9 +1584,11 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
                 start_ts = step_starts.pop(key, None)
                 if start_ts is None and timestamp:
                     start_ts = int(timestamp)
+                duration = None
                 if timestamp and start_ts is not None:
                     duration = max(0.0, (int(timestamp) - start_ts) / 1000.0)
                     metrics["model_time_s"] += duration
+                    durations.append(duration)
                 tokens = part.get("tokens") or {}
                 input_tokens = int(tokens.get("input") or 0)
                 output_tokens = int(tokens.get("output") or 0)
@@ -1522,21 +1601,36 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
                 metrics["reasoning_tokens"] += reasoning
                 metrics["cache_read_tokens"] += read
                 metrics["cache_write_tokens"] += write
-                total = input_tokens + output_tokens + reasoning + read + write
-                metrics["total_tokens"] += total
-                request_tokens.append(input_tokens + output_tokens + reasoning)
+                metrics["total_tokens"] += (
+                    input_tokens + output_tokens + reasoning + read + write
+                )
+                request_tokens.append(input_tokens + read + write)
+                generated = output_tokens + reasoning
+                if duration and duration > 0 and generated > 0:
+                    step_rates.append(generated / duration)
+                if "cost" in part:
+                    metrics["cost_known"] = True
+                try:
+                    metrics["cost_usd"] += float(part.get("cost") or 0)
+                except (TypeError, ValueError):
+                    pass
             elif kind == "tool_use":
-                command = json.dumps(part.get("state") or {})
-                match = SELF_TEST_RE.search(command)
-                if match:
+                tool = str(part.get("tool") or "")
+                state = part.get("state") or {}
+                command = str((state.get("input") or {}).get("command") or "")
+                if tool == "shell" and SELF_TEST_RE.search(command):
                     metrics["self_test_runs"] += 1
-                if BUILD_TOOL_RE.search(command):
-                    metrics["build_tool_s"] += 0.0
-    metrics["self_test_s"] = self_test_s
-    metrics["wall_ex_self_test_s"] = max(0.0, wall_s - self_test_s)
+    metrics["steps"] = steps
+    metrics["wall_ex_self_test_s"] = max(0.0, wall_s - metrics["self_test_s"])
     if request_tokens:
         metrics["max_request_tokens"] = max(request_tokens)
         metrics["mean_request_tokens"] = sum(request_tokens) / len(request_tokens)
+    if durations:
+        metrics["step_median_s"] = statistics.median(durations)
+        metrics["step_p90_s"] = percentile(durations, 0.9)
+        metrics["step_max_s"] = max(durations)
+    if step_rates:
+        metrics["gen_tokens_per_s_median"] = statistics.median(step_rates)
     generation = metrics["output_tokens"] + metrics["reasoning_tokens"]
     if metrics["model_time_s"] > 0:
         metrics["gen_tokens_per_s"] = generation / metrics["model_time_s"]
@@ -1546,38 +1640,545 @@ def read_agent_usage(log_path: Path, wall_s: float) -> dict:
     return metrics
 
 
+def _json_int(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
+    """Time-split metrics from the OpenCode SQLite session database.
+
+    The database records each assistant message with `created`, `streamed` and
+    `completed` timestamps, plus per-content-block timings. Reasoning and tool
+    blocks are children of the same message, so this separates thinking from
+    tool execution without a model proxy.
+    """
+    result = {
+        "available": False,
+        "span_s": None,
+        "agent_s": None,
+        "ttft_s": None,
+        "think_s": None,
+        "output_s": None,
+        "tool_s": None,
+        "tool_shell_s": None,
+        "tool_write_s": None,
+        "tool_read_s": None,
+        "tool_other_s": None,
+        "self_test_s": 0.0,
+        "self_test_runs": 0,
+        "self_test_failures": 0,
+        "build_tool_s": 0.0,
+        "retries": 0,
+        "retry_s": 0.0,
+        "compaction_tokens": 0,
+        "compaction_cost_usd": 0.0,
+        "db_cost_usd": 0.0,
+        "db_input_tokens": 0,
+        "db_output_tokens": 0,
+        "db_reasoning_tokens": 0,
+        "db_cache_read_tokens": 0,
+        "db_cache_write_tokens": 0,
+        "assistant_steps": 0,
+        "max_request_tokens": None,
+        "mean_request_tokens": None,
+        "step_median_s": None,
+        "step_p90_s": None,
+        "step_max_s": None,
+        "gen_tokens_per_s_median": None,
+    }
+    database = data_dir / "opencode.db"
+    if not database.exists():
+        return result
+
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return result
+
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "select name from sqlite_master where type = 'table'"
+            )
+        }
+        if "session_message" not in tables:
+            connection.close()
+            return result
+        rows = connection.execute(
+            "select type, seq, time_created, data from session_message "
+            "order by time_created, seq"
+        ).fetchall()
+    except sqlite3.Error:
+        connection.close()
+        return result
+
+    try:
+        first_user: int | None = None
+        last_assistant: int | None = None
+        total_agent = 0.0
+        total_ttft = 0.0
+        total_think = 0.0
+        total_output = 0.0
+        tool_totals = {"shell": 0.0, "write": 0.0, "read": 0.0, "other": 0.0}
+        request_tokens: list[int] = []
+        durations: list[float] = []
+        step_rates: list[float] = []
+
+        for message_type, _seq, row_created, raw in rows:
+            try:
+                data = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            times = data.get("time") or {}
+            created = int(times.get("created") or row_created or 0)
+            completed = int(times.get("completed") or 0)
+            streamed = int(times.get("streamed") or completed or 0)
+
+            if message_type == "user" and created:
+                first_user = created if first_user is None else min(first_user, created)
+                continue
+            if message_type == "compaction":
+                tokens = data.get("tokens") or {}
+                cache = tokens.get("cache") or {}
+                result["compaction_tokens"] += sum(
+                    _json_int(tokens.get(key))
+                    for key in ("input", "output", "reasoning")
+                )
+                result["compaction_tokens"] += _json_int(cache.get("read"))
+                result["compaction_tokens"] += _json_int(cache.get("write"))
+                try:
+                    result["compaction_cost_usd"] += float(data.get("cost") or 0)
+                except (TypeError, ValueError):
+                    pass
+                continue
+            if message_type != "assistant":
+                continue
+
+            # Provider errors/retries are not model generation. They stay in
+            # the wall clock (and are reported as retry_s) but must not inflate
+            # think/output time or depress tok/s with zero-token attempts.
+            errored = bool(data.get("error")) or str(
+                data.get("finish") or ""
+            ).lower() == "error"
+            if errored:
+                if created and (completed or streamed):
+                    finished = completed or streamed
+                    result["retries"] += 1
+                    result["retry_s"] += max(0, finished - created) / 1000.0
+                    last_assistant = (
+                        finished
+                        if last_assistant is None
+                        else max(last_assistant, finished)
+                    )
+                continue
+
+            result["assistant_steps"] += 1
+            tokens = data.get("tokens") or {}
+            cache = tokens.get("cache") or {}
+            result["db_input_tokens"] += _json_int(tokens.get("input"))
+            result["db_output_tokens"] += _json_int(tokens.get("output"))
+            result["db_reasoning_tokens"] += _json_int(tokens.get("reasoning"))
+            result["db_cache_read_tokens"] += _json_int(cache.get("read"))
+            result["db_cache_write_tokens"] += _json_int(cache.get("write"))
+            request_tokens.append(
+                _json_int(tokens.get("input"))
+                + _json_int(cache.get("read"))
+                + _json_int(cache.get("write"))
+            )
+            try:
+                result["db_cost_usd"] += float(data.get("cost") or 0)
+            except (TypeError, ValueError):
+                pass
+
+            if not created or not completed:
+                continue
+            last_assistant = completed if last_assistant is None else max(
+                last_assistant, completed
+            )
+            message_duration = max(0, completed - created) / 1000.0
+            total_agent += message_duration
+            durations.append(message_duration)
+            generated = _json_int(tokens.get("output")) + _json_int(
+                tokens.get("reasoning")
+            )
+            if message_duration > 0 and generated > 0:
+                step_rates.append(generated / message_duration)
+
+            timed: list[tuple[int, dict, dict]] = []
+            for block in data.get("content") or []:
+                if not isinstance(block, dict):
+                    continue
+                block_time = block.get("time") or {}
+                start = int(block_time.get("created") or 0)
+                if start:
+                    timed.append((start, block_time, block))
+            if not timed:
+                continue
+            timed.sort(key=lambda item: item[0])
+
+            first_block = timed[0][0]
+            total_ttft += max(0, first_block - created) / 1000.0
+
+            reasoning = [item for item in timed if item[2].get("type") == "reasoning"]
+            if reasoning:
+                reasoning_start = min(item[0] for item in reasoning)
+                boundary = min(
+                    (
+                        item[0]
+                        for item in timed
+                        if item[2].get("type") != "reasoning"
+                        and item[0] >= reasoning_start
+                    ),
+                    default=streamed or reasoning_start,
+                )
+                boundary = max(reasoning_start, min(boundary, streamed or boundary))
+                total_think += max(0, boundary - reasoning_start) / 1000.0
+                if streamed:
+                    total_output += max(0, streamed - boundary) / 1000.0
+            elif streamed:
+                total_output += max(0, streamed - first_block) / 1000.0
+
+            for _start, block_time, block in timed:
+                if block.get("type") != "tool":
+                    continue
+                ran = int(block_time.get("ran") or 0)
+                finished = int(block_time.get("completed") or ran or 0)
+                if not ran or not finished or finished < ran:
+                    continue
+                duration = (finished - ran) / 1000.0
+                name = str(block.get("name") or "other")
+                state = block.get("state") or {}
+                command = str((state.get("input") or {}).get("command") or "")
+                output = " ".join(
+                    str(part.get("text") or "")
+                    for part in (state.get("content") or [])
+                    if isinstance(part, dict)
+                )
+                if name == "shell" and SELF_TEST_RE.search(command):
+                    result["self_test_s"] += duration
+                    result["self_test_runs"] += 1
+                    exit_code = (state.get("metadata") or {}).get("exit")
+                    failed = bool(
+                        re.search(r"\b[1-9]\d*\s+failed\b", output, re.IGNORECASE)
+                        or re.search(r"\bFAILED\b", output)
+                    )
+                    if failed or (exit_code not in (None, 0, "0")):
+                        result["self_test_failures"] += 1
+                elif name == "shell" and BUILD_TOOL_RE.search(command):
+                    result["build_tool_s"] += duration
+                if name == "shell":
+                    tool_totals["shell"] += duration
+                elif name in ("write", "edit", "patch"):
+                    tool_totals["write"] += duration
+                elif name in ("read", "glob", "grep", "list"):
+                    tool_totals["read"] += duration
+                else:
+                    tool_totals["other"] += duration
+
+        if first_user and last_assistant and last_assistant >= first_user:
+            result["span_s"] = (last_assistant - first_user) / 1000.0
+        result["agent_s"] = total_agent
+        result["ttft_s"] = total_ttft
+        result["think_s"] = total_think
+        result["output_s"] = total_output
+        result["tool_s"] = sum(tool_totals.values())
+        result["tool_shell_s"] = tool_totals["shell"]
+        result["tool_write_s"] = tool_totals["write"]
+        result["tool_read_s"] = tool_totals["read"]
+        result["tool_other_s"] = tool_totals["other"]
+        if request_tokens:
+            result["max_request_tokens"] = max(request_tokens)
+            result["mean_request_tokens"] = sum(request_tokens) / len(request_tokens)
+        if durations:
+            result["step_median_s"] = statistics.median(durations)
+            result["step_p90_s"] = percentile(durations, 0.9)
+            result["step_max_s"] = max(durations)
+        if step_rates:
+            result["gen_tokens_per_s_median"] = statistics.median(step_rates)
+        result["available"] = True
+        return result
+    finally:
+        connection.close()
+
+
+def compute_metrics(
+    log_path: Path | None,
+    data_dir: Path | None,
+    wall_s: float,
+    *,
+    usage: dict | None = None,
+) -> dict:
+    """Merge log token usage and session timings into persisted metric fields.
+
+    The database is authoritative for the effort split; the log is the fallback
+    when a run kept no `opencode-data` tree (for example the mock agent).
+    """
+    if usage is None:
+        usage = read_agent_usage(log_path or Path("/nonexistent"), wall_s)
+    session = (
+        read_session_metrics(data_dir, wall_s)
+        if data_dir is not None
+        else {"available": False}
+    )
+    log_available = bool(usage.get("available", True))
+    db_available = bool(session.get("available"))
+
+    if log_available:
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        reasoning_tokens = int(usage.get("reasoning_tokens") or 0)
+        cache_read_tokens = int(usage.get("cache_read_tokens") or 0)
+        cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
+        cost_usd = float(usage.get("cost_usd") or 0)
+        cost_known = bool(usage.get("cost_known"))
+        steps = int(usage.get("steps") or 0)
+    elif db_available:
+        input_tokens = int(session["db_input_tokens"])
+        output_tokens = int(session["db_output_tokens"])
+        reasoning_tokens = int(session["db_reasoning_tokens"])
+        cache_read_tokens = int(session["db_cache_read_tokens"])
+        cache_write_tokens = int(session["db_cache_write_tokens"])
+        cost_usd = float(session.get("db_cost_usd") or 0)
+        cost_known = bool(session.get("db_cost_usd"))
+        steps = int(session["assistant_steps"])
+    else:
+        input_tokens = output_tokens = reasoning_tokens = 0
+        cache_read_tokens = cache_write_tokens = 0
+        cost_usd = 0.0
+        cost_known = False
+        steps = 0
+
+    max_request_tokens = usage.get("max_request_tokens")
+    mean_request_tokens = usage.get("mean_request_tokens")
+    if not max_request_tokens and db_available:
+        max_request_tokens = session.get("max_request_tokens")
+        mean_request_tokens = session.get("mean_request_tokens")
+
+    compaction_tokens = int(session.get("compaction_tokens") or 0) if db_available else 0
+    if db_available:
+        compaction_cost = float(session.get("compaction_cost_usd") or 0)
+        if log_available:
+            cost_usd += compaction_cost
+        else:
+            cost_usd = float(session.get("db_cost_usd") or 0) + compaction_cost
+        cost_known = cost_known or cost_usd > 0
+    total_tokens = (
+        input_tokens
+        + output_tokens
+        + reasoning_tokens
+        + cache_read_tokens
+        + cache_write_tokens
+        + compaction_tokens
+    )
+
+    metrics: dict[str, object] = {
+        "available": log_available or db_available,
+        "span_s": wall_s,
+        "agent_s": float(session["agent_s"]) if db_available else wall_s,
+        "steps": steps,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "compaction_tokens": compaction_tokens,
+        "total_tokens": total_tokens,
+        "max_request_tokens": max_request_tokens,
+        "mean_request_tokens": mean_request_tokens,
+        "cost_usd": round(cost_usd, 6),
+        "cost_known": cost_known,
+        "self_test_runs": int(
+            session.get("self_test_runs")
+            if db_available
+            else (usage.get("self_test_runs") or 0)
+        ),
+        "self_test_failures": int(session.get("self_test_failures") or 0),
+        "retries": int(
+            session.get("retries") if db_available else (usage.get("retries") or 0)
+        ),
+        "metrics_source": "db+log"
+        if db_available and log_available
+        else ("db" if db_available else ("log" if log_available else "none")),
+        "metrics_version": METRICS_VERSION,
+    }
+
+    if db_available:
+        for key in (
+            "ttft_s",
+            "think_s",
+            "output_s",
+            "tool_s",
+            "tool_shell_s",
+            "tool_write_s",
+            "tool_read_s",
+            "tool_other_s",
+            "self_test_s",
+            "build_tool_s",
+            "retry_s",
+            "step_median_s",
+            "step_p90_s",
+            "step_max_s",
+            "gen_tokens_per_s_median",
+        ):
+            metrics[key] = session.get(key)
+        buckets = [
+            metrics.get("ttft_s"),
+            metrics.get("think_s"),
+            metrics.get("output_s"),
+            metrics.get("tool_s"),
+        ]
+        known = [float(value) for value in buckets if value is not None]
+        accounted = sum(known)
+        # Message timestamps can overlap slightly when turns are queued; the
+        # harness wall time remains the hard total. Scale the buckets so they
+        # cannot exceed it.
+        if wall_s and accounted > float(wall_s):
+            factor = float(wall_s) / accounted
+            for key in ("ttft_s", "think_s", "output_s", "tool_s"):
+                value = metrics.get(key)
+                if value is not None:
+                    metrics[key] = float(value) * factor
+            tool_total = float(metrics.get("tool_s") or 0)
+            for key in ("self_test_s", "build_tool_s"):
+                value = metrics.get(key)
+                if value is not None:
+                    metrics[key] = min(float(value) * factor, tool_total)
+            accounted = float(wall_s)
+        other = max(0.0, float(wall_s) - accounted) if wall_s else None
+        metrics["other_s"] = other
+        if other is not None and metrics.get("retry_s") is not None:
+            metrics["retry_s"] = min(float(metrics["retry_s"]), float(other))
+
+        def share(value: object) -> float | None:
+            if value is None or not wall_s:
+                return None
+            return max(0.0, min(1.0, float(value) / float(wall_s)))
+
+        metrics["ttft_share"] = share(metrics.get("ttft_s"))
+        metrics["think_share"] = share(metrics.get("think_s"))
+        metrics["output_share"] = share(metrics.get("output_s"))
+        metrics["model_time_s"] = sum(
+            float(metrics.get(key) or 0.0)
+            for key in ("ttft_s", "think_s", "output_s")
+        )
+        metrics["tool_share"] = share(metrics.get("tool_s"))
+        metrics["other_share"] = share(other)
+        metrics["self_test_share"] = share(metrics.get("self_test_s"))
+        metrics["wall_ex_self_test_s"] = (
+            max(0.0, float(wall_s) - float(metrics.get("self_test_s") or 0))
+            if wall_s
+            else None
+        )
+        generation_s = float(metrics.get("think_s") or 0) + float(
+            metrics.get("output_s") or 0
+        )
+        metrics["gen_tokens_per_s"] = (
+            (output_tokens + reasoning_tokens) / generation_s
+            if generation_s > 0
+            else None
+        )
+    else:
+        # Per-block timings are unavailable without the session database. Keep
+        # the log-derived model time for ranking, but report the effort split
+        # as unknown rather than as a misleading zero.
+        for key in (
+            "ttft_s",
+            "think_s",
+            "output_s",
+            "tool_s",
+            "tool_shell_s",
+            "tool_write_s",
+            "tool_read_s",
+            "tool_other_s",
+            "other_s",
+            "self_test_s",
+            "build_tool_s",
+            "retry_s",
+            "ttft_share",
+            "think_share",
+            "output_share",
+            "tool_share",
+            "other_share",
+            "self_test_share",
+        ):
+            metrics[key] = None
+        metrics["model_time_s"] = (
+            float(usage["model_time_s"]) if usage.get("model_time_s") else None
+        )
+        metrics["wall_ex_self_test_s"] = float(wall_s) if wall_s else None
+        metrics["gen_tokens_per_s"] = usage.get("gen_tokens_per_s")
+        metrics["step_median_s"] = usage.get("step_median_s")
+        metrics["step_p90_s"] = usage.get("step_p90_s")
+        metrics["step_max_s"] = usage.get("step_max_s")
+        metrics["gen_tokens_per_s_median"] = usage.get("gen_tokens_per_s_median")
+
+    metrics["tokens_per_step"] = (
+        (input_tokens + output_tokens + reasoning_tokens) / steps if steps else None
+    )
+    cache_total = input_tokens + cache_read_tokens
+    metrics["cache_hit_rate"] = (
+        cache_read_tokens / cache_total if cache_total else None
+    )
+    return metrics
+
+
 def combine_attempt_metrics(attempts: list[dict]) -> dict:
     """Merge the usage metrics of every attempt of one round."""
     total_wall = sum(float(item.get("wall_s") or 0.0) for item in attempts)
-    merged: dict | None = None
-    request_max = 0
-    means: list[float] = []
-    for item in attempts:
-        usage = read_agent_usage(
+    usages = [
+        read_agent_usage(
             Path(item.get("log_path") or ""), float(item.get("wall_s") or 0.0)
         )
-        request_max = max(request_max, int(usage.get("max_request_tokens") or 0))
-        if usage.get("mean_request_tokens") is not None:
-            means.append(float(usage["mean_request_tokens"]))
-        if merged is None:
-            merged = dict(usage)
-            continue
-        for key, value in usage.items():
-            if key in {
-                "max_request_tokens",
-                "mean_request_tokens",
-                "gen_tokens_per_s",
-                "metrics_source",
-                "metrics_version",
-            }:
-                continue
-            if isinstance(value, (int, float)) and isinstance(merged.get(key), (int, float)):
-                merged[key] += value
-    if merged is None:
+        for item in attempts
+    ]
+    if not usages:
         return read_agent_usage(Path("/nonexistent"), total_wall)
+    merged = read_agent_usage(Path("/nonexistent"), total_wall)
+    merged["available"] = any(usage.get("available") for usage in usages)
+    additive_skip = {
+        "available",
+        "span_s",
+        "agent_s",
+        "wall_ex_self_test_s",
+        "max_request_tokens",
+        "mean_request_tokens",
+        "gen_tokens_per_s",
+        "gen_tokens_per_s_median",
+        "step_median_s",
+        "step_p90_s",
+        "step_max_s",
+        "other_s",
+        "metrics_source",
+        "metrics_version",
+        "cost_known",
+    }
+    for key in merged:
+        if key in additive_skip:
+            continue
+        values = [
+            float(usage[key])
+            for usage in usages
+            if isinstance(usage.get(key), (int, float))
+        ]
+        merged[key] = sum(values) if values else None
+    merged["cost_known"] = any(usage.get("cost_known") for usage in usages)
+    request_max = max(int(usage.get("max_request_tokens") or 0) for usage in usages)
+    means = [
+        float(usage["mean_request_tokens"])
+        for usage in usages
+        if usage.get("mean_request_tokens") is not None
+    ]
     merged["span_s"] = total_wall
     merged["agent_s"] = total_wall
-    merged["wall_ex_self_test_s"] = max(0.0, total_wall - float(merged.get("self_test_s") or 0.0))
+    merged["wall_ex_self_test_s"] = max(
+        0.0, total_wall - float(merged.get("self_test_s") or 0.0)
+    )
     merged["max_request_tokens"] = request_max
     merged["mean_request_tokens"] = sum(means) / len(means) if means else 0.0
     merged["other_s"] = max(
@@ -1587,6 +2188,13 @@ def combine_attempt_metrics(attempts: list[dict]) -> dict:
         - float(merged.get("tool_s") or 0.0)
         - float(merged.get("self_test_s") or 0.0),
     )
+    for key in ("step_median_s", "step_p90_s", "step_max_s", "gen_tokens_per_s_median"):
+        values = [
+            float(usage[key])
+            for usage in usages
+            if usage.get(key) is not None
+        ]
+        merged[key] = statistics.median(values) if values else None
     generation = float(merged.get("output_tokens") or 0.0) + float(
         merged.get("reasoning_tokens") or 0.0
     )
@@ -1595,6 +2203,48 @@ def combine_attempt_metrics(attempts: list[dict]) -> dict:
     )
     merged["metrics_source"] = "round-logs"
     return merged
+
+
+def refresh_run_metrics(meta: dict, run_dir: Path) -> bool:
+    """Recompute effort/token fields for a saved run from its artifacts.
+
+    Returns True when any persisted metric changed. Informational only: the
+    score, quality and eligibility fields are untouched.
+    """
+    candidates = list(meta.get("agent_logs") or [])
+    if not candidates and meta.get("agent_log"):
+        candidates = [meta["agent_log"]]
+    logs = [Path(path) for path in candidates if Path(path).is_file()]
+    if not logs:
+        legacy = run_dir / "agent.log"
+        logs = [legacy] if legacy.exists() else []
+    wall = float(meta.get("wall_s") or 0.0)
+    per_log = wall / len(logs) if logs and wall else 0.0
+    usage = combine_attempt_metrics(
+        [{"log_path": str(log), "wall_s": per_log} for log in logs]
+    )
+    metrics = compute_metrics(
+        None, run_dir / "opencode-data", wall, usage=usage
+    )
+    metrics["compactions"] = count_compactions(run_dir / "opencode-data")
+    if not metrics.get("steps") and meta.get("steps") is not None:
+        metrics["steps"] = int(meta.get("steps") or 0)
+    if meta.get("gate_pass") in (None, ""):
+        rounds = meta.get("rounds") or []
+        best = next(
+            (row for row in rounds if row.get("round") == meta.get("best_round")),
+            None,
+        )
+        for candidate in ([best] if best else []) + rounds:
+            if candidate and candidate.get("gate_total") not in (None, ""):
+                metrics["gate_pass"] = candidate.get("gate_pass")
+                metrics["gate_total"] = candidate.get("gate_total")
+                break
+    before = {key: meta.get(key) for key in metrics}
+    for key, value in metrics.items():
+        if value is not None:
+            meta[key] = value
+    return before != {key: meta.get(key) for key in metrics}
 
 
 def workdir_manifest(root: Path) -> dict[str, str]:
@@ -2267,6 +2917,31 @@ def write_run_report(run_dir: Path, meta: dict, score: dict) -> None:
         ),
         f"- steps: {meta.get('steps', 0)}",
         f"- files changed: {meta.get('files_changed', 0)}",
+        *(
+            [
+                f"- model time: {format_duration(meta.get('model_time_s'))}"
+                f" (rank tie-breaker; TTFT {format_duration(meta.get('ttft_s'))},"
+                f" thinking {format_duration(meta.get('think_s'))},"
+                f" output {format_duration(meta.get('output_s'))})",
+                f"- effort: tools {format_duration(meta.get('tool_s'))},"
+                f" self-test {format_duration(meta.get('self_test_s'))}"
+                f" ({int(meta.get('self_test_runs') or 0)} runs),"
+                f" other {format_duration(meta.get('other_s'))},"
+                f" provider retry {format_duration(meta.get('retry_s'))}",
+                f"- request tokens: peak {format_tokens(meta.get('max_request_tokens'))}"
+                f" / mean {format_tokens(meta.get('mean_request_tokens'))}"
+                f"; total {format_tokens(meta.get('total_tokens'))}"
+                f" ({format_tokens(meta.get('reasoning_tokens'))} reasoning)",
+                f"- generation: {_fmt(meta.get('gen_tokens_per_s'), 1)} tok/s"
+                f" (median step {_fmt(meta.get('gen_tokens_per_s_median'), 1)})"
+                f"; cache hit {format_percent(meta.get('cache_hit_rate'))}"
+                f"; cost {_fmt(meta.get('cost_usd'), 4)} USD",
+                f"- provider retries: {int(meta.get('retries') or 0)}"
+                f"; metrics source: {meta.get('metrics_source')}",
+            ]
+            if str(meta.get("metrics_source") or "") in {"db", "db+log"}
+            else []
+        ),
         f"- build: {'ok' if meta['build_ok'] else 'failed'}"
         f" (seed {'ok' if meta.get('seed_build_ok') else 'FAILED'})",
         f"- gates: {'pass' if score['gate_ok'] else 'fail'}"
@@ -2419,18 +3094,31 @@ def leaderboard_entries(rows: list[dict]) -> list[dict]:
         )
         if not eligible:
             score *= LEADERBOARD_INELIGIBLE_FACTOR
+        wall = _float(row.get("wall_s"))
+        work = _float(row.get("wall_ex_self_test_s"))
+        compactions = (
+            int(_float(row.get("compactions")))
+            if row.get("compactions") not in (None, "") and _float(row.get("compactions")) is not None
+            else None
+        )
         entries.append(
             {
                 **row,
                 "_score": score,
                 "_eligible": eligible,
                 "_model_time": _float(row.get("model_time_s")),
+                "_wall": wall or 0.0,
+                "_wall_work": work if work is not None else (wall or 0.0),
+                "_compactions": compactions,
+                "_decode": _float(row.get("decode_speedup")),
+                "_encode": _float(row.get("encode_speedup")),
             }
         )
     entries.sort(
         key=lambda entry: (
             -entry["_score"],
             entry["_model_time"] if entry["_model_time"] is not None else float("inf"),
+            entry["_compactions"] if entry["_compactions"] is not None else 0,
             entry.get("timestamp", ""),
         )
     )
@@ -2455,8 +3143,216 @@ def _median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+def thinking_label(row: dict) -> str:
+    thinking = row.get("thinking") or "unknown"
+    effort = row.get("reasoning_effort") or ""
+    return f"{thinking} ({effort})" if effort else str(thinking)
+
+
+def reasoning_key(row: dict) -> str:
+    return (
+        row.get("reasoning_effort") or row.get("thinking") or "unknown"
+    ).strip().lower() or "unknown"
+
+
+def reasoning_rank(row: dict) -> int:
+    return REASONING_ORDER.get(reasoning_key(row), -1)
+
+
+def provider_label(row: dict) -> str:
+    return str(
+        row.get("provider") or provider_of(str(row.get("model", ""))) or "unknown"
+    )
+
+
+def run_started(row: dict) -> datetime | None:
+    """Parse the run's UTC start timestamp."""
+    value = (row.get("timestamp") or "").strip()
+    if not value:
+        run_id = (row.get("run_id") or "").strip()
+        if len(run_id) >= 16:
+            value = run_id[:16]
+    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S"):
+        try:
+            return datetime.strptime(value, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def started_label(row: dict) -> tuple[str, str]:
+    """Return a short UTC start time and a full tooltip for the runner."""
+    started = run_started(row)
+    if started is None:
+        return "—", ""
+    return (
+        started.strftime("%b %d %H:%M"),
+        started.strftime("%Y-%m-%d %H:%M:%S UTC"),
+    )
+
+
+def _data_attr(value: object) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        return f"{float(value):.6f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _share_of(entry: dict, share_key: str, seconds_key: str) -> float | None:
+    share = _float(entry.get(share_key))
+    if share is not None:
+        return max(0.0, min(1.0, share))
+    seconds = _float(entry.get(seconds_key))
+    wall = entry.get("_wall") or 0.0
+    if seconds is not None and wall:
+        return max(0.0, min(1.0, seconds / float(wall)))
+    return None
+
+
+def _render_effort_cell(entry: dict, escaped) -> str:
+    shares = [
+        ("ttft", _share_of(entry, "ttft_share", "ttft_s"), _float(entry.get("ttft_s"))),
+        ("think", _share_of(entry, "think_share", "think_s"), _float(entry.get("think_s"))),
+        ("out", _share_of(entry, "output_share", "output_s"), _float(entry.get("output_s"))),
+        ("tool", _share_of(entry, "tool_share", "tool_s"), _float(entry.get("tool_s"))),
+        ("other", _share_of(entry, "other_share", "other_s"), _float(entry.get("other_s"))),
+    ]
+    if all(share is None for _, share, _ in shares):
+        return '<span class="muted">—</span>'
+    values = [max(0.0, float(share or 0)) for _, share, _ in shares]
+    total = sum(values)
+    if total <= 0:
+        return '<span class="muted">—</span>'
+    segments = "".join(
+        f'<span class="seg {name}" style="width:{value / total * 100:.2f}%"></span>'
+        for (name, _, _), value in zip(shares, values)
+    )
+    labels = ["TTFT", "thinking", "output", "tools", "other"]
+    parts = []
+    for label, (_, share, seconds) in zip(labels, shares):
+        if share is None:
+            continue
+        parts.append(
+            f"{label} {format_optional_duration(seconds)} ({format_percent(share)})"
+        )
+    title = escaped(" · ".join(parts))
+    percentages = "".join(
+        f'<span class="pct {name}">{format_percent(share)}</span>'
+        for label, (name, share, _) in zip(labels, shares)
+        if share is not None
+    )
+    meta_parts = []
+    if entry.get("_model_time") is not None:
+        meta_parts.append(f"model {format_optional_duration(entry['_model_time'])}")
+    peak = _float(entry.get("max_request_tokens"))
+    if peak:
+        meta_parts.append(f"peak {format_tokens(peak)} req tok")
+    toks_median = _float(entry.get("gen_tokens_per_s_median"))
+    toks = _float(entry.get("gen_tokens_per_s"))
+    if toks_median is not None:
+        meta_parts.append(f"{toks_median:.0f} tok/s med")
+    elif toks is not None:
+        meta_parts.append(f"{toks:.0f} tok/s")
+    meta = (
+        f'<span class="effort-meta">{" · ".join(meta_parts)}</span>'
+        if meta_parts
+        else ""
+    )
+    run_id = escaped(str(entry.get("run_id", "")))
+    return (
+        f'<button type="button" class="detail-btn" aria-label="Effort details for {run_id}">'
+        f'<span class="split" role="img" aria-label="{title}">{segments}</span>'
+        f'<span class="effort-pcts">{percentages}</span>'
+        f"{meta}"
+        "</button>"
+    )
+
+
+def _render_model_medians(entries: list[dict], escaped) -> str:
+    groups: dict[tuple[str, str, str], list[dict]] = {}
+    for entry in entries:
+        key = (
+            str(entry.get("model", "")),
+            str(entry.get("variant") or "default"),
+            thinking_label(entry),
+        )
+        groups.setdefault(key, []).append(entry)
+    if not groups:
+        return ""
+
+    def values(items: list[dict], key: str) -> list[float]:
+        out = []
+        for item in items:
+            number = _float(item.get(key))
+            if number is not None:
+                out.append(number)
+        return out
+
+    rows_html = []
+    for (model, variant, thinking), items in sorted(groups.items()):
+        runs = len(items)
+        score = median_or_none([item["_score"] for item in items])
+        decode = median_or_none(values(items, "_decode"))
+        encode = median_or_none(values(items, "_encode"))
+        wall = median_or_none(values(items, "_wall"))
+        model_time = median_or_none(values(items, "_model_time"))
+        work = median_or_none(values(items, "_wall_work"))
+        think = median_or_none(values(items, "think_share"))
+        output = median_or_none(values(items, "output_share"))
+        tool = median_or_none(values(items, "tool_share"))
+        self_test = median_or_none(values(items, "self_test_share"))
+        tokens = median_or_none(values(items, "max_request_tokens"))
+        reason = median_or_none(values(items, "reasoning_tokens"))
+        toks = median_or_none(values(items, "gen_tokens_per_s_median"))
+        if toks is None:
+            toks = median_or_none(values(items, "gen_tokens_per_s"))
+        retries = median_or_none(values(items, "retries"))
+        retries_cell = (
+            f'<td class="num">{retries:.0f}</td>'
+            if retries is not None
+            else '<td class="num">—</td>'
+        )
+        rows_html.append(
+            "<tr>"
+            f"<td>{escaped(model)}</td>"
+            f"<td>{escaped(variant)}</td>"
+            f"<td>{escaped(thinking)}</td>"
+            f'<td class="num">{runs}</td>'
+            f'<td class="num">{score:.1f}</td>'
+            f'<td class="num">{f"x{decode:.3f}" if decode is not None else "—"}</td>'
+            f'<td class="num">{f"x{encode:.3f}" if encode is not None else "—"}</td>'
+            f'<td class="num">{format_optional_duration(wall)}</td>'
+            f'<td class="num">{format_optional_duration(model_time)}</td>'
+            f'<td class="num">{format_optional_duration(work)}</td>'
+            f'<td class="num">{format_percent(think)}</td>'
+            f'<td class="num">{format_percent(output)}</td>'
+            f'<td class="num">{format_percent(tool)}</td>'
+            f'<td class="num">{format_percent(self_test)}</td>'
+            f'<td class="num">{format_tokens(tokens)}</td>'
+            f'<td class="num">{format_tokens(reason)}</td>'
+            f'<td class="num">{format_tokens(toks)}</td>'
+            f"{retries_cell}"
+            "</tr>"
+        )
+    return (
+        '<details class="medians"><summary>Model medians (all runs)</summary>'
+        '<div class="table-wrap"><table class="medians-table"><thead><tr>'
+        "<th>Model</th><th>Variant</th><th>Thinking</th><th>Runs</th>"
+        "<th>Score med</th><th>Decode med</th><th>Encode med</th>"
+        "<th>Wall med</th><th>Model med</th><th>Work med</th><th>Think% med</th>"
+        "<th>Out% med</th><th>Tool% med</th><th>Self-test% med</th>"
+        "<th>Peak req tok med</th><th>Reason tok med</th><th>tok/s med</th>"
+        "<th>Retries med</th>"
+        "</tr></thead><tbody>"
+        + "".join(rows_html)
+        + "</tbody></table></div></details>"
+    )
+
+
 def aggregate_entries(rows: list[dict]) -> list[dict]:
-    groups: dict[tuple[str, str], list[dict]] = {}
+    groups: dict[tuple[str, str, str], list[dict]] = {}
     for row in rows:
         if not row.get("run_id"):
             continue
@@ -2465,10 +3361,14 @@ def aggregate_entries(rows: list[dict]) -> list[dict]:
             "provider-error",
         }:
             continue
-        key = (str(row.get("model") or "?"), str(row.get("variant") or "default"))
+        key = (
+            str(row.get("model") or "?"),
+            str(row.get("variant") or "default"),
+            thinking_label(row),
+        )
         groups.setdefault(key, []).append(row)
     entries: list[dict] = []
-    for (model, variant), group in groups.items():
+    for (model, variant, thinking), group in groups.items():
         all_scores = [score_row(row) for row in group]
         eligible_rows = [
             row for row in group if str(row.get("eligible", "")).lower() == "true"
@@ -2479,33 +3379,40 @@ def aggregate_entries(rows: list[dict]) -> list[dict]:
             1.0 if str(row.get("gate_ok", "")).lower() == "true" else 0.0
             for row in group
         ]
-        decode = [
-            float(row.get("decode_speedup"))
-            for row in scored_rows
-            if _float(row.get("decode_speedup")) is not None
-        ]
-        encode = [
-            float(row.get("encode_speedup"))
-            for row in scored_rows
-            if _float(row.get("encode_speedup")) is not None
-        ]
-        model_time = [
-            float(row.get("model_time_s"))
-            for row in scored_rows
-            if _float(row.get("model_time_s")) is not None
-        ]
+
+        def metric_values(key: str) -> list[float]:
+            return [
+                float(row[key])
+                for row in scored_rows
+                if _float(row.get(key)) is not None
+            ]
+
         entries.append(
             {
                 "model": model,
                 "variant": variant,
+                "thinking": thinking,
                 "runs": len(group),
                 "eligible_runs": len(eligible_rows),
                 "median_score": _median(scores) or 0.0,
                 "best_score": max(all_scores) if all_scores else 0.0,
                 "gate_rate": sum(gate_values) / len(gate_values) if gate_values else 0.0,
-                "median_decode": _median(decode),
-                "median_encode": _median(encode),
-                "median_model_time": _median(model_time),
+                "median_decode": _median(metric_values("decode_speedup")),
+                "median_encode": _median(metric_values("encode_speedup")),
+                "median_wall": _median(metric_values("wall_s")),
+                "median_model_time": _median(metric_values("model_time_s")),
+                "median_work": _median(metric_values("wall_ex_self_test_s")),
+                "median_think": _median(metric_values("think_share")),
+                "median_output": _median(metric_values("output_share")),
+                "median_tool": _median(metric_values("tool_share")),
+                "median_self_test": _median(metric_values("self_test_share")),
+                "median_request_tokens": _median(metric_values("max_request_tokens")),
+                "median_reasoning_tokens": _median(metric_values("reasoning_tokens")),
+                "median_toks": _median(
+                    metric_values("gen_tokens_per_s_median")
+                    or metric_values("gen_tokens_per_s")
+                ),
+                "median_retries": _median(metric_values("retries")),
                 "confidence": "multi-run" if len(group) >= 3 else "single-run",
                 "network": sorted({str(row.get("network_policy") or "unknown") for row in group}),
                 "cpu": sorted({str(row.get("cpu_set") or "unknown") for row in group}),
@@ -2517,6 +3424,7 @@ def aggregate_entries(rows: list[dict]) -> list[dict]:
             entry["median_model_time"] if entry["median_model_time"] is not None else float("inf"),
             entry["model"],
             entry["variant"],
+            entry["thinking"],
         )
     )
     return entries
@@ -2526,27 +3434,73 @@ def _esc(value: object) -> str:
     return html.escape("" if value is None else str(value))
 
 
-def render_leaderboard(rows: list[dict]) -> str:
+def render_leaderboard(
+    rows: list[dict],
+    *,
+    public: bool = False,
+    title: str = "opencode-bench-htj2k leaderboard",
+    subtitle: str | None = None,
+) -> str:
     entries = leaderboard_entries(rows)
-    summaries = aggregate_entries(rows)
     escaped = html.escape
 
-    def num(value: object, digits: int = 3) -> float | None:
-        try:
-            return round(float(value), digits)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
+    providers = sorted({provider_label(entry) for entry in entries})
+    reasoning_values = sorted(
+        {reasoning_key(entry) for entry in entries},
+        key=lambda value: (-REASONING_ORDER.get(value, -1), value),
+    )
+    provider_options = '<option value="">All providers</option>' + "".join(
+        f'<option value="{escaped(provider)}">{escaped(provider)}</option>'
+        for provider in providers
+    )
+    reasoning_options = '<option value="">All reasoning</option>' + "".join(
+        f'<option value="{escaped(value)}">{escaped(value)}</option>'
+        for value in reasoning_values
+    )
 
     eligible_entries = [entry for entry in entries if entry["_eligible"]]
-    decode_values = [num(entry.get("decode_speedup")) for entry in eligible_entries]
-    decode_values = [value for value in decode_values if value is not None]
-    encode_values = [num(entry.get("encode_speedup")) for entry in eligible_entries]
-    encode_values = [value for value in encode_values if value is not None]
-    best_score = max((entry["_score"] for entry in eligible_entries), default=None)
+    decode_values = [
+        entry["_decode"] for entry in eligible_entries if entry["_decode"] is not None
+    ]
+    encode_values = [
+        entry["_encode"] for entry in eligible_entries if entry["_encode"] is not None
+    ]
+    toks_values = [
+        float(entry["gen_tokens_per_s_median"])
+        if _float(entry.get("gen_tokens_per_s_median")) is not None
+        else float(entry["gen_tokens_per_s"])
+        for entry in entries
+        if _float(entry.get("gen_tokens_per_s_median")) is not None
+        or _float(entry.get("gen_tokens_per_s")) is not None
+    ]
+    think_values = [
+        float(entry["think_share"])
+        for entry in entries
+        if _float(entry.get("think_share")) is not None
+    ]
+    fastest_eligible = min(
+        (
+            entry["_model_time"]
+            for entry in eligible_entries
+            if entry["_model_time"]
+        ),
+        default=None,
+    )
+    retries_total = sum(int(_float(entry.get("retries")) or 0) for entry in entries)
+    best_score = max(
+        (entry["_score"] for entry in eligible_entries),
+        default=None,
+    )
     cards = [
         ("Runs", str(len(entries))),
         ("Eligible", str(len(eligible_entries))),
         ("Best score", f"{best_score:.1f}" if best_score is not None else "—"),
+        (
+            "Fastest model time",
+            format_optional_duration(fastest_eligible)
+            if fastest_eligible is not None
+            else "—",
+        ),
         (
             "Median decode",
             f"x{_median(decode_values):.3f}" if decode_values else "—",
@@ -2555,7 +3509,15 @@ def render_leaderboard(rows: list[dict]) -> str:
             "Median encode",
             f"x{_median(encode_values):.3f}" if encode_values else "—",
         ),
-        ("Models", str(len(summaries))),
+        (
+            "Median tok/s",
+            f"{median_or_none(toks_values):.0f}" if toks_values else "—",
+        ),
+        (
+            "Median think",
+            format_percent(median_or_none(think_values)) if think_values else "—",
+        ),
+        ("Retries", str(retries_total)),
     ]
     cards_html = "".join(
         f'<div class="card"><span>{escaped(label)}</span><b>{escaped(value)}</b></div>'
@@ -2577,16 +3539,24 @@ def render_leaderboard(rows: list[dict]) -> str:
         status, status_kind = status_of(entry)
         model = escaped(str(entry.get("model", "")))
         variant = escaped(str(entry.get("variant") or "default"))
+        thinking = escaped(thinking_label(entry))
+        run_id = escaped(str(entry.get("run_id", "")))
+        provider = provider_label(entry)
+        reasoning = reasoning_key(entry)
         hardware = str(entry.get("hardware") or "").strip()
         hardware_line = (
             f'<div class="hardware">{escaped(hardware)}</div>' if hardware else ""
         )
+        started, started_full = started_label(entry)
+        started_epoch = 0
+        started_dt = run_started(entry)
+        if started_dt is not None:
+            started_epoch = int(started_dt.timestamp())
         issue = entry.get("_issue")
         issue_url = str(entry.get("_issue_url") or "")
+        submitter = str(entry.get("submitter") or "")
         if issue is not None and issue_url:
-            source = (
-                f'<a href="{escaped(issue_url)}" rel="noreferrer">#{escaped(str(issue))}</a>'
-            )
+            source = f'<a href="{escaped(issue_url)}" rel="noreferrer">#{escaped(str(issue))}</a>'
         else:
             source = '<span class="muted">—</span>'
         if entry.get("verified"):
@@ -2595,248 +3565,751 @@ def render_leaderboard(rows: list[dict]) -> str:
             evidence = '<span class="evidence reported">self-reported</span>'
         else:
             evidence = '<span class="evidence local">local</span>'
-        decode = num(entry.get("decode_speedup"))
-        encode = num(entry.get("encode_speedup"))
-        wall = num(entry.get("wall_s"), 1)
-        tokens = num(entry.get("total_tokens"), 0)
-        timestamp = str(entry.get("timestamp") or "")
+        source_cell = (
+            f'<td class="source">{source}<div>{evidence}</div>'
+            + (f'<div class="submitter">{escaped(submitter)}</div>' if submitter else "")
+            + "</td>"
+        )
+        decode = entry["_decode"]
+        encode = entry["_encode"]
+        gate_pass = _float(entry.get("gate_pass"))
+        gate_total = _float(entry.get("gate_total"))
+        if gate_pass is not None and gate_total is not None:
+            gates = f"{int(gate_pass)}/{int(gate_total)}"
+            gates_rank = int(gate_pass)
+        else:
+            gates = "—"
+            gates_rank = -1
+        compactions = (
+            "—" if entry["_compactions"] is None else str(entry["_compactions"])
+        )
+        wall_sub_parts = [f"model {format_optional_duration(entry.get('_model_time'))}"]
+        wall_sub_parts.append(f"work {format_optional_duration(entry['_wall_work'])}")
+        self_test_s = _float(entry.get("self_test_s"))
+        self_test_runs = int(_float(entry.get("self_test_runs")) or 0)
+        retries = int(_float(entry.get("retries")) or 0)
+        if self_test_s is not None or self_test_runs:
+            wall_sub_parts.append(
+                f"test {format_optional_duration(self_test_s)} · {self_test_runs} runs"
+            )
+        if retries:
+            wall_sub_parts.append(f"{retries} retr{'y' if retries == 1 else 'ies'}")
+        wall_sub = " · ".join(wall_sub_parts)
+        wall_title = (
+            f"total {format_optional_duration(entry['_wall'])}; "
+            f"model time {format_optional_duration(entry.get('_model_time'))}; "
+            f"excluding self-test {format_optional_duration(entry['_wall_work'])}; "
+            f"self-test {format_optional_duration(self_test_s)}"
+            + (f"; provider retries {retries}" if retries else "")
+        )
+        score_note = (
+            ""
+            if entry["_eligible"]
+            else (
+                f' title="raw {entry["_score"] / LEADERBOARD_INELIGIBLE_FACTOR:.1f}; '
+                f'ineligible score ×{LEADERBOARD_INELIGIBLE_FACTOR:g}"'
+            )
+        )
         search = escaped(
             " ".join(
                 [
                     str(entry.get("model", "")),
                     str(entry.get("variant", "")),
+                    thinking_label(entry),
+                    started,
                     str(entry.get("run_id", "")),
-                    hardware,
-                    timestamp,
+                    str(entry.get("hardware", "")),
+                    provider,
+                    submitter,
+                    str(entry.get("evidence_level", "")),
                 ]
             ).lower()
         )
         body.append(
-            f'<tr class="{"" if entry["_eligible"] else "ineligible"}"'
-            f' data-search="{search}" data-status="{status}"'
+            f'<tr class="{"ineligible" if not entry["_eligible"] else ""}"'
+            f' data-search="{search}" data-status="{escaped(status)}"'
+            f' data-provider="{escaped(provider)}" data-reasoning="{escaped(reasoning)}"'
+            f' data-model="{escaped(str(entry.get("model", "")))}"'
+            f' data-variant="{variant}" data-thinking="{reasoning_rank(entry)}"'
+            f' data-started="{started_epoch}"'
             f' data-score="{entry["_score"]:.6f}"'
-            f' data-decode="{decode if decode is not None else ""}"'
-            f' data-encode="{encode if encode is not None else ""}"'
-            f' data-wall="{wall if wall is not None else ""}"'
-            f' data-tokens="{tokens if tokens is not None else ""}"'
-            f' data-started="{escaped(timestamp)}">'
+            f' data-decode="{_data_attr(decode)}" data-encode="{_data_attr(encode)}"'
+            f' data-gates="{gates_rank}" data-wall="{entry["_wall"]:.6f}"'
+            f' data-wall-work="{entry["_wall_work"]:.6f}"'
+            f' data-model-time="{_data_attr(entry.get("_model_time"))}"'
+            f' data-compactions="{entry["_compactions"] if entry["_compactions"] is not None else 0}"'
+            f' data-eligible="{1 if entry["_eligible"] else 0}"'
+            f' data-tokens="{_data_attr(entry.get("total_tokens"))}"'
+            f' data-tokens-out="{_data_attr(entry.get("output_tokens"))}"'
+            f' data-tokens-max="{_data_attr(entry.get("max_request_tokens"))}"'
+            f' data-tokens-mean="{_data_attr(entry.get("mean_request_tokens"))}"'
+            f' data-tokens-reason="{_data_attr(entry.get("reasoning_tokens"))}"'
+            f' data-toks="{_data_attr(entry.get("gen_tokens_per_s"))}"'
+            f' data-toks-med="{_data_attr(entry.get("gen_tokens_per_s_median"))}"'
+            f' data-build-tool="{_data_attr(entry.get("build_tool_s"))}"'
+            f' data-ttft="{_data_attr(entry.get("ttft_s"))}"'
+            f' data-think="{_data_attr(entry.get("think_s"))}"'
+            f' data-output="{_data_attr(entry.get("output_s"))}"'
+            f' data-tool="{_data_attr(entry.get("tool_s"))}"'
+            f' data-other="{_data_attr(entry.get("other_s"))}"'
+            f' data-self-test="{_data_attr(entry.get("self_test_s"))}"'
+            f' data-self-test-runs="{_data_attr(entry.get("self_test_runs"))}"'
+            f' data-self-test-failures="{_data_attr(entry.get("self_test_failures"))}"'
+            f' data-retries="{_data_attr(entry.get("retries"))}"'
+            f' data-retry-s="{_data_attr(entry.get("retry_s"))}"'
+            f' data-steps="{_data_attr(entry.get("steps"))}"'
+            f' data-files="{_data_attr(entry.get("files_changed"))}"'
+            f' data-step-median="{_data_attr(entry.get("step_median_s"))}"'
+            f' data-step-p90="{_data_attr(entry.get("step_p90_s"))}"'
+            f' data-step-max="{_data_attr(entry.get("step_max_s"))}"'
+            f' data-agent="{_data_attr(entry.get("agent_s"))}"'
+            f' data-span="{_data_attr(entry.get("span_s"))}"'
+            f' data-tokens-step="{_data_attr(entry.get("tokens_per_step"))}"'
+            f' data-cache-rate="{_data_attr(entry.get("cache_hit_rate"))}"'
+            f' data-cost="{_data_attr(entry.get("cost_usd"))}"'
+            f' data-source="{escaped(str(entry.get("metrics_source") or ""))}"'
+            f' data-run="{run_id}">'
             f'<td class="rank">{index}</td>'
-            f'<td class="model"><div>{model} <span class="muted">{variant}</span></div>{hardware_line}</td>'
-            f'<td><div class="score"><span class="bar" style="width:{max(0.0, min(100.0, entry["_score"] / 2)):.1f}%"></span>'
-            f"<b>{entry['_score']:.1f}</b></div></td>"
+            f'<td><div class="score"{score_note}><span class="bar" style="width:'
+            f'{max(0.0, min(100.0, entry["_score"] / 2)):.1f}%"></span>'
+            f'<b>{entry["_score"]:.1f}</b></div></td>'
+            f'<td class="model"><div>{model}</div>{hardware_line}'
+            f'<div class="runid">{run_id}</div></td>'
+            f"{source_cell}"
+            f'<td class="started" title="{escaped(started_full)}">{escaped(started)}</td>'
+            f'<td>{variant}</td>'
+            f'<td>{thinking}</td>'
             f'<td class="num">{f"x{decode:.3f}" if decode is not None else "—"}</td>'
             f'<td class="num">{f"x{encode:.3f}" if encode is not None else "—"}</td>'
-            f'<td><span class="status {status_kind}">{status}</span></td>'
+            f'<td class="num gates">{gates}</td>'
+            f'<td><span class="status {status_kind}">{escaped(status)}</span></td>'
             f'<td>{escaped(str(entry.get("confidence") or "—"))}</td>'
             f'<td class="num">{escaped(str(entry.get("cpu_set") or "—"))}</td>'
             f'<td>{escaped(str(entry.get("network_policy") or "—"))}</td>'
-            f'<td class="source">{source}<div>{evidence}</div></td>'
-            f'<td class="started">{escaped(timestamp)}</td>'
+            f'<td class="wall" title="{escaped(wall_title)}">'
+            f'{format_optional_duration(entry["_wall"])}'
+            f'<div class="wall-sub">{escaped(wall_sub)}</div></td>'
+            f'<td class="effort">{_render_effort_cell(entry, escaped)}</td>'
+            f'<td class="num">{compactions}</td>'
             "</tr>"
         )
 
-    summary_body = []
-    for index, entry in enumerate(summaries, 1):
-        summary_body.append(
-            "<tr>"
-            f'<td class="rank">{index}</td>'
-            f'<td class="model"><div>{escaped(str(entry["model"]))} <span class="muted">{escaped(str(entry["variant"]))}</span></div></td>'
-            f'<td class="num">{entry["runs"]}</td>'
-            f'<td class="num"><b>{entry["median_score"]:.1f}</b></td>'
-            f'<td class="num">{entry["best_score"]:.1f}</td>'
-            f'<td class="num">{entry["gate_rate"] * 100:.0f}%</td>'
-            f'<td class="num">{_esc(_fmt(entry["median_decode"]))}</td>'
-            f'<td class="num">{_esc(_fmt(entry["median_encode"]))}</td>'
-            f'<td>{escaped(str(entry["confidence"]))}</td>'
-            f'<td>{escaped(", ".join(entry["network"]))}</td>'
-            "</tr>"
+    if not entries:
+        table = (
+            '<p class="empty">No runs yet. '
+            + (
+                "Submit one with <code>./bench.py submit --run RUN_ID --gh</code>."
+                if public
+                else "Start with <code>./bench.py run --model ...</code>."
+            )
+            + "</p>"
         )
+    else:
+        table = (
+            '<div class="table-wrap"><table id="runs">'
+            "<thead><tr>"
+            "<th>#</th>"
+            '<th data-sort="score" data-type="number" data-default-dir="desc">Score</th>'
+            '<th data-sort="model" data-type="text" data-default-dir="asc">Model / run</th>'
+            "<th>Source</th>"
+            '<th data-sort="started" data-type="number" data-default-dir="desc">Started (UTC)</th>'
+            '<th data-sort="variant" data-type="text" data-default-dir="asc">Variant</th>'
+            '<th data-sort="thinking" data-type="number" data-default-dir="desc">Thinking</th>'
+            '<th data-sort="decode" data-type="number" data-default-dir="desc">Decode</th>'
+            '<th data-sort="encode" data-type="number" data-default-dir="desc">Encode</th>'
+            '<th data-sort="gates" data-type="number" data-default-dir="desc">Gates</th>'
+            '<th data-sort="status" data-type="text" data-default-dir="asc">Status</th>'
+            "<th>Confidence</th>"
+            "<th>CPU</th>"
+            "<th>Network</th>"
+            '<th data-sort="wall" data-type="number" data-default-dir="asc">Wall / model / work</th>'
+            "<th>Effort</th>"
+            '<th data-sort="compactions" data-type="number" data-default-dir="asc">Compactions</th>'
+            "</tr></thead><tbody>"
+            + "".join(body)
+            + "</tbody></table></div>"
+        )
+        table += _render_model_medians(entries, escaped)
 
-    return f"""<!doctype html>
+    updated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    default_subtitle = (
+        "Lossless HTJ2K encode/decode optimisation. Score is seed-normalised: the "
+        "untouched seed is 0, matching the frozen target in both dimensions is 100 "
+        "(cap 200). Correctness gates must pass for eligibility. One pinned CPU, "
+        "agent network labelled per run. Effort splits come from the OpenCode "
+        "session database and never affect the score."
+    )
+    subtitle_text = subtitle or default_subtitle
+    footer_text = (
+        'Community results are self-reported unless marked '
+        '<span class="evidence verified">maintainer-checked</span>. Wall time and '
+        'tok/s are hardware-dependent; compare only similar setups. '
+        'Generated from labeled GitHub issues by <code>./bench.py site</code>. '
+        f'<a href="https://github.com/knopkem/opencode-bench-htj2k/blob/main/submissions/TEMPLATE.md">'
+        "Submission template</a>."
+        if public
+        else "Generated by <code>./bench.py leaderboard</code>. That command serves "
+        "the page and opens it in the browser; use <code>--write</code> to write the "
+        "file only. Raw data: <code>results-opencode-bench-htj2k.csv</code>. "
+        "Effort/token fields can be rebuilt from existing run artifacts with "
+        "<code>./bench.py backfill</code>."
+    )
+
+    template = """<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>opencode-bench-htj2k leaderboard</title>
+<title>__TITLE__</title>
 <style>
-:root {{ color-scheme: dark; --bg:#0f1117; --panel:#171a23; --line:#272c3a;
+:root { color-scheme: dark; --bg:#0f1117; --panel:#171a23; --line:#272c3a;
         --text:#e7ebf5; --muted:#8b93a7; --accent:#4a90d9; --good:#3ecf8e;
-        --warn:#f0b429; --bad:#ef5b5b; }}
-* {{ box-sizing: border-box; }}
-body {{ margin:0; padding:32px; background:var(--bg); color:var(--text);
-       font:15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
-header {{ display:flex; gap:24px; align-items:flex-end; justify-content:space-between;
-         flex-wrap:wrap; margin-bottom:20px; }}
-h1 {{ margin:0; font-size:28px; letter-spacing:-.02em; }}
-.sub {{ margin:6px 0 0; color:var(--muted); max-width:60rem; }}
-.cards {{ display:flex; gap:10px; flex-wrap:wrap; }}
-.card {{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
-        padding:10px 14px; min-width:110px; }}
-.card span {{ display:block; color:var(--muted); font-size:12px; text-transform:uppercase;
-             letter-spacing:.06em; }}
-.card b {{ font-size:20px; font-variant-numeric:tabular-nums; }}
-.formula {{ background:var(--panel); border:1px solid var(--line); border-radius:10px;
-           padding:12px 16px; color:var(--muted); margin-bottom:18px; }}
-.formula b {{ color:var(--text); }}
-.toolbar {{ display:flex; gap:12px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }}
-input[type="search"] {{ background:var(--panel); border:1px solid var(--line); color:var(--text);
-                       border-radius:8px; padding:9px 12px; min-width:260px; font:inherit; }}
-.toolbar label {{ color:var(--muted); }}
-select {{ background:var(--panel); border:1px solid var(--line); color:var(--text);
-         border-radius:8px; padding:9px 12px; font:inherit; }}
-.table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:12px; }}
-table {{ width:100%; border-collapse:collapse; min-width:1150px; }}
-thead th {{ position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
+        --warn:#f0b429; --bad:#ef5b5b; --ttft:#5b6478; --think:#8b7cf6;
+        --out:#3ecf8e; --tool:#f0b429; --other:#3a4050; }
+* { box-sizing: border-box; }
+body { margin:0; padding:32px; background:var(--bg); color:var(--text);
+       font:15px/1.5 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+header { display:flex; gap:24px; align-items:flex-end; justify-content:space-between;
+         flex-wrap:wrap; margin-bottom:20px; }
+h1 { margin:0; font-size:28px; letter-spacing:-.02em; }
+.sub { margin:6px 0 0; color:var(--muted); max-width:60rem; }
+.cards { display:flex; gap:10px; flex-wrap:wrap; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+        padding:10px 14px; min-width:110px; }
+.card span { display:block; color:var(--muted); font-size:12px; text-transform:uppercase;
+             letter-spacing:.06em; }
+.card b { font-size:20px; font-variant-numeric:tabular-nums; }
+.formula { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+           padding:12px 16px; color:var(--muted); margin-bottom:18px; }
+.formula b { color:var(--text); }
+.toolbar { display:flex; gap:12px; align-items:center; margin:0 0 14px; flex-wrap:wrap; }
+input[type="search"] { background:var(--panel); border:1px solid var(--line); color:var(--text);
+                       border-radius:8px; padding:9px 12px; min-width:280px; font:inherit; }
+.toolbar label { color:var(--muted); }
+select { background:var(--panel); border:1px solid var(--line); color:var(--text);
+         border-radius:8px; padding:9px 12px; font:inherit; }
+button { background:var(--accent); border:0; color:#fff; border-radius:8px; padding:9px 14px;
+         font:inherit; cursor:pointer; }
+.table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; }
+table { width:100%; border-collapse:collapse; min-width:1500px; }
+thead th { position:sticky; top:0; background:#1b1f2b; color:var(--muted); font-size:12px;
            text-transform:uppercase; letter-spacing:.05em; text-align:left; padding:12px 14px;
-           border-bottom:1px solid var(--line); white-space:nowrap; }}
-thead th[data-sort] {{ cursor:pointer; user-select:none; }}
-thead th[data-sort]:hover {{ color:var(--text); }}
-thead th[data-sort]::after {{ content:"↕"; opacity:.35; margin-left:6px; font-size:10px; }}
-thead th[data-sort][data-dir="asc"]::after {{ content:"▲"; opacity:1; }}
-thead th[data-sort][data-dir="desc"]::after {{ content:"▼"; opacity:1; }}
-tbody td {{ padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }}
-tbody tr:last-child td {{ border-bottom:0; }}
-tbody tr:hover {{ background:#1b1f2b; }}
-tr.ineligible {{ opacity:.55; }}
-.rank {{ font-size:18px; font-weight:700; color:var(--muted); }}
-tbody tr:nth-child(1) .rank {{ color:var(--warn); }}
-tbody tr:nth-child(2) .rank {{ color:#c9d1e3; }}
-tbody tr:nth-child(3) .rank {{ color:#b07d4f; }}
-.score {{ position:relative; min-width:110px; height:24px; display:flex; align-items:center; }}
-.score .bar {{ position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#2f6db3,#4a90d9);
-              border-radius:6px; opacity:.55; }}
-.score b {{ position:relative; padding-left:8px; font-variant-numeric:tabular-nums; }}
-.model div:first-child {{ font-weight:600; }}
-.hardware {{ color:var(--muted); font-size:11px; margin-top:2px; max-width:340px;
-            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-.num, .started {{ font-variant-numeric:tabular-nums; white-space:nowrap; }}
-.started {{ color:var(--muted); }}
-.source {{ white-space:nowrap; }}
-.source a {{ color:var(--accent); text-decoration:none; }}
-.source a:hover {{ text-decoration:underline; }}
-.status {{ display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
-          font-weight:700; text-transform:uppercase; letter-spacing:.04em; }}
-.status.good {{ background:rgba(62,207,142,.15); color:var(--good); }}
-.status.warn {{ background:rgba(240,180,41,.15); color:var(--warn); }}
-.status.bad {{ background:rgba(239,91,91,.15); color:var(--bad); }}
-.evidence {{ display:inline-block; margin-top:3px; padding:1px 7px; border-radius:999px;
-            font-size:10px; text-transform:uppercase; letter-spacing:.05em; }}
-.evidence.reported {{ background:rgba(240,180,41,.15); color:var(--warn); }}
-.evidence.verified {{ background:rgba(62,207,142,.15); color:var(--good); }}
-.evidence.local {{ background:rgba(74,144,217,.15); color:var(--accent); }}
-.muted {{ color:var(--muted); }}
-.median-wrap {{ margin-top:18px; background:var(--panel); border:1px solid var(--line);
-                border-radius:12px; padding:10px 14px; }}
-.median-wrap summary {{ cursor:pointer; color:var(--muted); font-weight:600; }}
-.median-wrap .table-wrap {{ margin-top:10px; border:0; }}
-.median-wrap table {{ min-width:900px; }}
-.empty {{ color:var(--muted); }}
+           border-bottom:1px solid var(--line); white-space:nowrap; }
+thead th[data-sort] { cursor:pointer; user-select:none; }
+thead th[data-sort]:hover { color:var(--text); }
+thead th[data-sort]::after { content:"↕"; opacity:.35; margin-left:6px; font-size:10px; }
+thead th[data-sort][data-dir="asc"]::after { content:"▲"; opacity:1; }
+thead th[data-sort][data-dir="desc"]::after { content:"▼"; opacity:1; }
+tbody td { padding:12px 14px; border-bottom:1px solid var(--line); vertical-align:middle; }
+tbody tr:last-child td { border-bottom:0; }
+tbody tr:hover { background:#1b1f2b; }
+tr.ineligible { opacity:.55; }
+.rank { font-size:18px; font-weight:700; color:var(--muted); }
+tbody tr:nth-child(1) .rank { color:var(--warn); }
+tbody tr:nth-child(2) .rank { color:#c9d1e3; }
+tbody tr:nth-child(3) .rank { color:#b07d4f; }
+.score { position:relative; min-width:120px; height:24px; display:flex; align-items:center; }
+.score .bar { position:absolute; inset:0 auto 0 0; background:linear-gradient(90deg,#2f6db3,#4a90d9);
+              border-radius:6px; opacity:.55; }
+.score b { position:relative; padding-left:8px; font-variant-numeric:tabular-nums; }
+.model div:first-child { font-weight:600; }
+.runid { color:var(--muted); font:11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace;
+         word-break:break-all; max-width:380px; }
+.started { color:var(--muted); white-space:nowrap; font-variant-numeric:tabular-nums; }
+.wall, .num { font-variant-numeric:tabular-nums; white-space:nowrap; }
+.wall-sub { color:var(--muted); font-size:11px; margin-top:2px; white-space:nowrap; }
+.hardware { color:var(--muted); font-size:11px; margin-top:2px; max-width:380px;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.source { white-space:nowrap; }
+.source a { color:var(--accent); text-decoration:none; }
+.source a:hover { text-decoration:underline; }
+.status { display:inline-block; padding:2px 8px; border-radius:999px; font-size:11px;
+          font-weight:700; text-transform:uppercase; letter-spacing:.04em; }
+.status.good { background:rgba(62,207,142,.15); color:var(--good); }
+.status.warn { background:rgba(240,180,41,.15); color:var(--warn); }
+.status.bad { background:rgba(239,91,91,.15); color:var(--bad); }
+.evidence { display:inline-block; margin-top:3px; padding:1px 7px; border-radius:999px;
+            font-size:10px; text-transform:uppercase; letter-spacing:.05em; }
+.evidence.reported { background:rgba(240,180,41,.15); color:var(--warn); }
+.evidence.verified { background:rgba(62,207,142,.15); color:var(--good); }
+.evidence.local { background:rgba(74,144,217,.15); color:var(--accent); }
+.submitter { color:var(--muted); font-size:11px; margin-top:2px; }
+.muted { color:var(--muted); }
+.detail-btn { background:transparent; border:0; padding:0; color:inherit; text-align:left;
+              cursor:pointer; }
+.detail-btn:hover .split { filter:brightness(1.18); }
+.split { display:flex; width:140px; height:10px; border-radius:999px; overflow:hidden;
+         background:#222736; }
+.seg { display:block; height:100%; }
+.seg.ttft { background:var(--ttft); }
+.seg.think { background:var(--think); }
+.seg.out { background:var(--out); }
+.seg.tool { background:var(--tool); }
+.seg.other { background:var(--other); }
+.effort { min-width:180px; }
+.effort-pcts { display:flex; gap:7px; margin-top:4px; font-size:11px;
+               font-variant-numeric:tabular-nums; }
+.pct { cursor:help; }
+.pct.ttft { color:#9aa4b8; }
+.pct.think { color:#b8adff; }
+.pct.out { color:#7ee2b5; }
+.pct.tool { color:#ffd166; }
+.pct.other { color:#8b93a7; }
+.effort-meta { display:block; margin-top:2px; color:var(--muted); font-size:11px;
+               white-space:nowrap; font-variant-numeric:tabular-nums; }
+.medians { margin-top:18px; background:var(--panel); border:1px solid var(--line);
+           border-radius:12px; padding:10px 14px; }
+.medians summary { cursor:pointer; color:var(--muted); font-weight:600; }
+.medians .table-wrap { margin-top:10px; border:0; }
+.medians-table { min-width:1300px; }
+.legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; font-size:12px;
+          color:var(--muted); }
+.legend i { display:inline-block; width:10px; height:10px; border-radius:3px;
+            margin-right:5px; vertical-align:-1px; }
+dialog.effort-dialog { background:var(--panel); color:var(--text); border:1px solid var(--line);
+                       border-radius:14px; padding:0; max-width:660px; width:calc(100% - 32px); }
+dialog.effort-dialog::backdrop { background:rgba(0,0,0,.55); }
+.effort-dialog header { display:flex; justify-content:space-between; align-items:center;
+                        padding:16px 20px; border-bottom:1px solid var(--line);
+                        margin:0; gap:12px; flex-wrap:nowrap; }
+.effort-dialog h2 { margin:0; font-size:18px; min-width:0; overflow-wrap:anywhere; }
+.effort-dialog header form { margin:0; flex:0 0 auto; }
+.effort-dialog .close { background:transparent; color:var(--muted); padding:2px 8px;
+                        font-size:22px; line-height:1; }
+.effort-dialog .body { padding:16px 20px 20px; display:grid;
+                       grid-template-columns:1fr 1fr; gap:16px 24px; font-size:14px; }
+.effort-dialog h3 { margin:0 0 6px; color:var(--muted); font-size:12px;
+                    text-transform:uppercase; letter-spacing:.06em; }
+.effort-dialog dl { margin:0; display:grid; grid-template-columns:auto 1fr; gap:4px 12px; }
+.effort-dialog dt { color:var(--muted); }
+.effort-dialog dd { margin:0; text-align:right; font-variant-numeric:tabular-nums; }
+.effort-note { grid-column:1/-1; color:var(--warn); font-size:12px; }
+.hover-tip { position:fixed; z-index:1000; max-width:300px; padding:7px 10px;
+             background:#1b1f2b; color:var(--text); border:1px solid var(--line);
+             border-radius:7px; box-shadow:0 8px 24px rgba(0,0,0,.35);
+             font-size:12px; line-height:1.4; pointer-events:none; }
+.hover-tip.effort-tip { max-width:460px; padding:10px 12px; }
+.tip-title { font-weight:600; margin-bottom:6px; }
+.tip-table { border-collapse:collapse; width:100%; min-width:0; font-size:12px; }
+.tip-table td { padding:2px 7px 2px 0; white-space:nowrap; vertical-align:middle; }
+.tip-table td.num { text-align:right; font-variant-numeric:tabular-nums; }
+.tip-table .tip-tokens { color:var(--muted); }
+.tip-table .dot { display:inline-block; width:8px; height:8px; border-radius:2px;
+                  margin-right:6px; vertical-align:0; }
+.dot.ttft { background:var(--ttft); }
+.dot.think { background:var(--think); }
+.dot.out { background:var(--out); }
+.dot.tool { background:var(--tool); }
+.dot.other { background:var(--other); }
+.tip-footer { margin-top:6px; padding-top:6px; border-top:1px solid var(--line);
+              color:var(--muted); font-variant-numeric:tabular-nums; }
+.tip-note { margin-top:4px; color:var(--warn); }
+footer { color:var(--muted); margin-top:18px; font-size:13px; }
+code { background:#1b1f2b; border:1px solid var(--line); border-radius:5px; padding:1px 5px; }
+.empty { color:var(--muted); }
+@media (max-width:700px) { body { padding:18px; } h1 { font-size:22px; } }
 </style>
 </head>
 <body>
 <header>
   <div>
-    <h1>opencode-bench-htj2k</h1>
-    <p class="sub">Lossless HTJ2K encode/decode optimisation. Score is seed-normalised: the
-    untouched seed is 0, matching the frozen target in both dimensions is 100 (cap 200).
-    Correctness gates must pass for eligibility. The grader runs on one pinned CPU and the
-    agent network is labelled per run. One run is accepted but low-confidence; three runs
-    with different seeds are recommended. Rows marked <i>self-reported</i> are community
-    submissions, <i>maintainer-checked</i> ones are verified.</p>
+    <h1>__TITLE__</h1>
+    <p class="sub">__SUBTITLE__ · updated __UPDATED__</p>
   </div>
-  <div class="cards">{cards_html}</div>
+  <div class="cards">__CARDS__</div>
 </header>
-<div class="formula">score = <b>100 · (0.5 · decode-credit + 0.5 · encode-credit)</b>,
-credited per dimension as clamp((speedup − 1 − 0.08) / (target − 1 − 0.08), 0, 2) against
-frozen targets (decode x1.35, encode x1.25). Ineligible rows keep 75% of their score and are dimmed.</div>
+<div class="formula">
+  <b>score = 100 · (0.5 · decode-credit + 0.5 · encode-credit)</b>, credited per
+  dimension as clamp((speedup − 1 − 0.08) / (target − 1 − 0.08), 0, 2) against
+  frozen targets (decode x1.35, encode x1.25). Ineligible rows keep
+  __INELIGIBLE__ of their score and are dimmed; hover the score for the raw value.
+  Runs rank by score, then model time, then start time.
+  <div class="legend">
+    <span><i style="background:var(--ttft)"></i>TTFT (wait for first token)</span>
+    <span><i style="background:var(--think)"></i>thinking</span>
+    <span><i style="background:var(--out)"></i>model output / code</span>
+    <span><i style="background:var(--tool)"></i>tool execution</span>
+    <span><i style="background:var(--other)"></i>startup / gaps</span>
+  </div>
+  <p style="margin:8px 0 0">Effort is derived from <code>opencode.db</code> timings,
+  not from a model proxy. Request tokens are the per-request prompt size (input +
+  cache reads/writes); peak and mean are shown rather than cumulative run totals.
+  Token counts are provider-reported; a thinking phase with <b>0 reasoning
+  tokens</b> means the provider did not report them. Hover the effort cell for the
+  breakdown, or click for step distribution, cache hit rate and cost. tok/s is
+  hardware-dependent. Effort never changes the score.</p>
+</div>
 <div class="toolbar">
-  <input id="search" type="search" placeholder="Filter by model, run id, hardware…">
-  <label>status
-    <select id="status">
-      <option value="">all</option>
-      <option value="eligible">eligible</option>
-      <option value="ineligible">ineligible</option>
-      <option value="agent-error">agent-error</option>
-    </select>
-  </label>
+  <input id="filter" type="search" placeholder="Filter model, variant, thinking or run id">
+  <label for="filter-status">Status</label>
+  <select id="filter-status">
+    <option value="">All statuses</option>
+    <option value="eligible">eligible</option>
+    <option value="ineligible">ineligible</option>
+    <option value="agent-error">agent-error</option>
+  </select>
+  <label for="filter-provider">Provider</label>
+  <select id="filter-provider">__PROVIDER_OPTIONS__</select>
+  <label for="filter-reasoning">Reasoning</label>
+  <select id="filter-reasoning">__REASONING_OPTIONS__</select>
+  <button type="button" onclick="location.reload()">Refresh</button>
 </div>
-<div class="table-wrap">
-<table id="runs">
-<thead><tr>
-<th>##</th>
-<th>model</th>
-<th data-sort="score">score</th>
-<th data-sort="decode">decode</th>
-<th data-sort="encode">encode</th>
-<th>status</th>
-<th>confidence</th>
-<th>cpu</th>
-<th>network</th>
-<th>source</th>
-<th data-sort="started">run</th>
-</tr></thead>
-<tbody>
-{''.join(body) or '<tr><td colspan="11" class="empty">no runs yet</td></tr>'}
-</tbody>
-</table>
-</div>
-<details class="median-wrap">
-<summary>Models (median over runs)</summary>
-<div class="table-wrap">
-<table>
-<thead><tr><th>##</th><th>model</th><th>runs</th><th>median score</th><th>best</th><th>gate rate</th><th>decode</th><th>encode</th><th>confidence</th><th>network</th></tr></thead>
-<tbody>
-{''.join(summary_body) or '<tr><td colspan="10" class="empty">no runs yet</td></tr>'}
-</tbody>
-</table>
-</div>
-</details>
+__TABLE__
+<dialog id="effort-dialog" class="effort-dialog">
+  <header>
+    <h2 id="effort-title">Effort details</h2>
+    <form method="dialog"><button class="close" aria-label="Close">×</button></form>
+  </header>
+  <div class="body" id="effort-body"></div>
+</dialog>
+<div id="hover-tip" class="hover-tip" hidden></div>
+<footer>__FOOTER__</footer>
 <script>
-(function () {{
-  var search = document.getElementById('search');
-  var status = document.getElementById('status');
-  var table = document.getElementById('runs');
-  var rows = Array.prototype.slice.call(table.tBodies[0].rows);
-  function apply() {{
-    var q = search.value.toLowerCase();
-    var st = status.value;
-    rows.forEach(function (row) {{
-      var ok = (!q || row.dataset.search.indexOf(q) !== -1)
-        && (!st || row.dataset.status === st);
-      row.style.display = ok ? '' : 'none';
-    }});
-  }}
-  search.addEventListener('input', apply);
-  status.addEventListener('change', apply);
-  Array.prototype.forEach.call(table.tHead.rows[0].cells, function (th) {{
-    if (!th.dataset.sort) return;
-    th.addEventListener('click', function () {{
-      var key = th.dataset.sort;
-      var dir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
-      Array.prototype.forEach.call(table.tHead.rows[0].cells, function (other) {{
-        other.removeAttribute('data-dir');
-      }});
-      th.dataset.dir = dir;
-      var mult = dir === 'asc' ? 1 : -1;
-      rows.sort(function (a, b) {{
-        var av = a.dataset[key] || '';
-        var bv = b.dataset[key] || '';
-        var an = parseFloat(av);
-        var bn = parseFloat(bv);
-        var cmp = (av !== '' && bv !== '' && !isNaN(an) && !isNaN(bn))
-          ? an - bn
-          : String(av).localeCompare(String(bv));
-        return cmp * mult;
-      }});
-      rows.forEach(function (row) {{ table.tBodies[0].appendChild(row); }});
-      apply();
-    }});
-  }});
-}})();
+const search = document.getElementById('filter');
+const statusFilter = document.getElementById('filter-status');
+const providerFilter = document.getElementById('filter-provider');
+const reasoningFilter = document.getElementById('filter-reasoning');
+const tableBody = document.querySelector('#runs tbody');
+const SORT_STATE_KEY = 'opencode-bench-htj2k-sort-state';
+const FILTER_KEY = 'opencode-bench-htj2k-filters';
+let sortKey = 'score';
+let sortDir = 'desc';
+try {
+  const savedSort = JSON.parse(localStorage.getItem(SORT_STATE_KEY) || '{}');
+  if (savedSort.key && document.querySelector('th[data-sort="' + savedSort.key + '"]')) {
+    sortKey = savedSort.key;
+    sortDir = savedSort.dir === 'asc' ? 'asc' : 'desc';
+  }
+  const savedFilters = JSON.parse(localStorage.getItem(FILTER_KEY) || '{}');
+  if (savedFilters.status && statusFilter) statusFilter.value = savedFilters.status;
+  if (savedFilters.provider && providerFilter) providerFilter.value = savedFilters.provider;
+  if (savedFilters.reasoning && reasoningFilter) reasoningFilter.value = savedFilters.reasoning;
+} catch (error) {}
+
+function saveFilters() {
+  try {
+    localStorage.setItem(FILTER_KEY, JSON.stringify({
+      status: statusFilter?.value || '',
+      provider: providerFilter?.value || '',
+      reasoning: reasoningFilter?.value || ''
+    }));
+  } catch (error) {}
+}
+
+function updateRanks() {
+  if (!tableBody) return;
+  let rank = 0;
+  for (const row of tableBody.querySelectorAll('tr')) {
+    const cell = row.querySelector('.rank');
+    if (row.style.display === 'none') {
+      if (cell) cell.textContent = '';
+    } else {
+      rank += 1;
+      if (cell) cell.textContent = String(rank);
+    }
+  }
+}
+
+function applyView() {
+  if (!tableBody) return;
+  const needle = (search?.value || '').trim().toLowerCase();
+  const status = statusFilter?.value || '';
+  const provider = providerFilter?.value || '';
+  const reasoning = reasoningFilter?.value || '';
+  for (const row of tableBody.querySelectorAll('tr')) {
+    const ok = (!needle || row.dataset.search.includes(needle))
+      && (!status || row.dataset.status === status)
+      && (!provider || row.dataset.provider === provider)
+      && (!reasoning || row.dataset.reasoning === reasoning);
+    row.style.display = ok ? '' : 'none';
+  }
+  updateRanks();
+}
+
+function sortRows() {
+  if (!tableBody) return;
+  const header = document.querySelector('th[data-sort="' + sortKey + '"]');
+  const type = header?.dataset.type || 'text';
+  const direction = sortDir === 'asc' ? 1 : -1;
+  const rows = [...tableBody.querySelectorAll('tr')];
+  rows.sort((a, b) => {
+    let av;
+    let bv;
+    let aMissing = false;
+    let bMissing = false;
+    if (type === 'number') {
+      const rawA = a.dataset[sortKey];
+      const rawB = b.dataset[sortKey];
+      aMissing = rawA === undefined || rawA === '';
+      bMissing = rawB === undefined || rawB === '';
+      av = aMissing ? 0 : Number(rawA);
+      bv = bMissing ? 0 : Number(rawB);
+    } else {
+      av = (a.dataset[sortKey] || '').toLowerCase();
+      bv = (b.dataset[sortKey] || '').toLowerCase();
+    }
+    if (type === 'number') {
+      if (aMissing && !bMissing) return 1;
+      if (bMissing && !aMissing) return -1;
+    }
+    if (av < bv) return -1 * direction;
+    if (av > bv) return direction;
+    const score = Number(b.dataset.score || 0) - Number(a.dataset.score || 0);
+    if (score) return score;
+    return (a.dataset.run || '').localeCompare(b.dataset.run || '');
+  });
+  rows.forEach((row) => tableBody.appendChild(row));
+  for (const th of document.querySelectorAll('th[data-sort]')) {
+    th.removeAttribute('data-dir');
+    th.removeAttribute('aria-sort');
+  }
+  if (header) {
+    header.dataset.dir = sortDir;
+    header.setAttribute('aria-sort', sortDir === 'asc' ? 'ascending' : 'descending');
+  }
+  updateRanks();
+}
+
+for (const header of document.querySelectorAll('th[data-sort]')) {
+  header.addEventListener('click', () => {
+    const key = header.dataset.sort;
+    if (key === sortKey) {
+      sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      sortKey = key;
+      sortDir = header.dataset.defaultDir || 'asc';
+    }
+    try {
+      localStorage.setItem(SORT_STATE_KEY, JSON.stringify({key: sortKey, dir: sortDir}));
+    } catch (error) {}
+    sortRows();
+    applyView();
+  });
+}
+
+const effortDialog = document.getElementById('effort-dialog');
+const effortBody = document.getElementById('effort-body');
+const effortTitle = document.getElementById('effort-title');
+
+function fmtSec(value) {
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  const total = Math.max(0, Math.round(number));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0')
+    + ':' + String(seconds).padStart(2, '0');
+}
+
+function fmtPct(value) {
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  return (number * 100).toFixed(0) + '%';
+}
+
+function fmtTok(value) {
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  if (number >= 1e9) return (number / 1e9).toFixed(1).replace(/\\.0$/, '') + 'B';
+  if (number >= 1e6) return (number / 1e6).toFixed(1).replace(/\\.0$/, '') + 'M';
+  if (number >= 1e3) return (number / 1e3).toFixed(1).replace(/\\.0$/, '') + 'k';
+  return String(Math.round(number));
+}
+
+function fmtNum(value, digits = 0) {
+  const number = Number(value);
+  if (value === undefined || value === '' || Number.isNaN(number)) return '—';
+  return number.toFixed(digits);
+}
+
+function esc(value) {
+  return String(value).replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  }[character]));
+}
+
+function detailList(items) {
+  return items.map(([label, value]) => '<dt>' + esc(label) + '</dt><dd>' + value + '</dd>').join('');
+}
+
+function effortBodyHtml(row) {
+  const data = row.dataset;
+  const note = Number(data.tokensReason || 0) === 0 && Number(data.think || 0) > 60
+    ? '<p class="effort-note">Provider reported zero reasoning tokens; the time split still shows the thinking phase.</p>'
+    : '';
+  const outputNote = Number(data.output || 0) < 1 && Number(data.tokensOut || 0) > 1000
+    ? '<p class="effort-note">No separate timestamped output block was recorded; output time is a lower bound.</p>'
+    : '';
+  const retryNote = Number(data.retries || 0) > 0
+    ? '<p class="effort-note">Provider errors/retries are counted in wall time and other, but excluded from think/output and tok/s.</p>'
+    : '';
+  const sourceNote = data.source === 'log'
+    ? '<p class="effort-note">No session database for this run; only log token totals and model time are available.</p>'
+    : '';
+  return ''
+    + '<div><h3>Time</h3><dl>' + detailList([
+      ['Wall', fmtSec(data.wall)],
+      ['Model time (rank tie-breaker)', fmtSec(data.modelTime)],
+      ['Wall excl. self-test', fmtSec(Number(data.wall || 0) - Number(data.selfTest || 0))],
+      ['Agent turns', fmtSec(data.agent)],
+      ['TTFT (wait for first token)', fmtSec(data.ttft)],
+      ['TTFT / step', Number(data.steps || 0) > 0 ? fmtSec(Number(data.ttft || 0) / Number(data.steps)) : '—'],
+      ['Thinking', fmtSec(data.think)],
+      ['Model output', fmtSec(data.output)],
+      ['Tool execution', fmtSec(data.tool)],
+      ['Self-test', fmtSec(data.selfTest)],
+      ['Build / typecheck', fmtSec(data.buildTool)],
+      ['Provider retry', fmtSec(data.retryS)],
+      ['Other', fmtSec(data.other)]
+    ]) + '</dl></div>'
+    + '<div><h3>Request tokens</h3><dl>' + detailList([
+      ['Peak request', fmtTok(data.tokensMax)],
+      ['Mean request', fmtTok(data.tokensMean)],
+      ['Output', fmtTok(data.tokensOut)],
+      ['Reasoning', fmtTok(data.tokensReason)],
+      ['Total', fmtTok(data.tokens)]
+    ]) + '</dl></div>'
+    + '<div><h3>Steps</h3><dl>' + detailList([
+      ['Steps', fmtNum(data.steps)],
+      ['Files changed', fmtNum(data.files)],
+      ['Median step', fmtSec(data.stepMedian)],
+      ['p90 step', fmtSec(data.stepP90)],
+      ['Max step', fmtSec(data.stepMax)]
+    ]) + '</dl></div>'
+    + '<div><h3>Rates</h3><dl>' + detailList([
+      ['Generation tok/s', fmtNum(data.toks, 1)],
+      ['Median step tok/s', fmtNum(data.toksMed, 1)],
+      ['Self-test runs', fmtNum(data.selfTestRuns)],
+      ['Self-test failures', fmtNum(data.selfTestFailures)],
+      ['Retries', fmtNum(data.retries)],
+      ['Tokens / step', fmtTok(data.tokensStep)],
+      ['Cache hit rate', fmtPct(data.cacheRate)],
+      ['Cost', fmtNum(data.cost, 4)]
+    ]) + '</dl></div>'
+    + note + outputNote + retryNote + sourceNote
+    + '<p class="effort-note">Source: ' + esc(data.source || 'none') + '. tok/s excludes failed/retried attempts; aggregate is output+reasoning over think+output time, median is per step. Hardware-dependent.</p>';
+}
+
+function effortTipHtml(row) {
+  const data = row.dataset;
+  const wall = Number(data.wall || 0);
+  const share = (value) => wall > 0 ? Math.round(Number(value || 0) / wall * 100) + '%' : '—';
+  const reasoning = Number(data.tokensReason || 0);
+  const thinkTokens = reasoning
+    ? fmtTok(reasoning) + ' reasoning'
+    : (Number(data.think || 0) > 0 ? 'not reported' : '—');
+  const rows = [
+    ['ttft', 'TTFT', data.ttft, '—'],
+    ['think', 'Thinking', data.think, thinkTokens],
+    ['out', 'Output', data.output, fmtTok(data.tokensOut) + ' output tok'],
+    ['tool', 'Tools', data.tool, 'no model tokens'],
+    ['other', 'Other', data.other, 'no model tokens']
+  ];
+  const rowsHtml = rows.map(([kind, label, seconds, tokens]) => (
+    '<tr><td><i class="dot ' + kind + '"></i>' + esc(label) + '</td>'
+    + '<td class="num">' + fmtSec(seconds) + '</td>'
+    + '<td class="num">' + share(seconds) + '</td>'
+    + '<td class="tip-tokens">' + tokens + '</td></tr>'
+  )).join('');
+  const caveat = reasoning === 0 && Number(data.think || 0) > 60 && Number(data.tokensOut || 0) > 1000
+    ? '<div class="tip-note">Output tokens may include unreported reasoning.</div>'
+    : '';
+  const retries = Number(data.retries || 0);
+  return '<div class="tip-title">Effort · ' + fmtSec(data.wall) + '</div>'
+    + '<table class="tip-table">' + rowsHtml + '</table>'
+    + '<div class="tip-footer">peak ' + fmtTok(data.tokensMax) + ' / mean ' + fmtTok(data.tokensMean) + ' req tok'
+    + ' · ' + fmtNum(data.toks, 1) + ' tok/s aggregate / ' + fmtNum(data.toksMed, 1) + ' median'
+    + ' · self-test ' + fmtSec(data.selfTest) + ' (' + fmtNum(data.selfTestRuns) + ' runs)'
+    + (retries ? ' · ' + retries + ' retr' + (retries === 1 ? 'y' : 'ies') : '')
+    + ' · ' + fmtNum(data.steps) + ' steps · ' + fmtPct(data.cacheRate) + ' cache</div>'
+    + caveat;
+}
+
+function showEffort(row) {
+  if (hoverTip) hoverTip.hidden = true;
+  effortTitle.textContent = 'Effort · ' + (row.dataset.run || 'run');
+  effortBody.innerHTML = effortBodyHtml(row);
+  if (typeof effortDialog.showModal === 'function') {
+    effortDialog.showModal();
+  } else {
+    effortDialog.setAttribute('open', '');
+  }
+}
+
+for (const button of document.querySelectorAll('.detail-btn')) {
+  button.addEventListener('click', () => {
+    const row = button.closest('tr');
+    if (row) showEffort(row);
+  });
+}
+
+effortDialog?.addEventListener('click', (event) => {
+  if (event.target === effortDialog) effortDialog.close();
+});
+
+const hoverTip = document.getElementById('hover-tip');
+function placeHoverTip(event, target) {
+  const tipRect = hoverTip.getBoundingClientRect();
+  let clientX;
+  let clientY;
+  if (event && typeof event.clientX === 'number' && event.clientX) {
+    clientX = event.clientX;
+    clientY = event.clientY;
+  } else {
+    const rect = target.getBoundingClientRect();
+    clientX = rect.left + rect.width / 2;
+    clientY = rect.top;
+  }
+  let x = clientX + 12;
+  let y = clientY + 16;
+  if (x + tipRect.width > window.innerWidth - 8) x = clientX - tipRect.width - 12;
+  if (y + tipRect.height > window.innerHeight - 8) y = clientY - tipRect.height - 16;
+  hoverTip.style.left = Math.max(8, x) + 'px';
+  hoverTip.style.top = Math.max(8, y) + 'px';
+}
+function showEffortTip(row, event, target) {
+  hoverTip.className = 'hover-tip effort-tip';
+  hoverTip.innerHTML = effortTipHtml(row);
+  hoverTip.hidden = false;
+  placeHoverTip(event, target);
+}
+for (const button of document.querySelectorAll('.detail-btn')) {
+  button.addEventListener('mouseenter', (event) => {
+    const row = button.closest('tr');
+    if (row) showEffortTip(row, event, button);
+  });
+  button.addEventListener('mousemove', (event) => placeHoverTip(event, button));
+  button.addEventListener('mouseleave', () => { hoverTip.hidden = true; });
+}
+window.addEventListener('scroll', () => { hoverTip.hidden = true; }, true);
+
+search?.addEventListener('input', applyView);
+statusFilter?.addEventListener('change', () => { saveFilters(); applyView(); });
+providerFilter?.addEventListener('change', () => { saveFilters(); applyView(); });
+reasoningFilter?.addEventListener('change', () => { saveFilters(); applyView(); });
+
+sortRows();
+applyView();
+
+if (new URLSearchParams(location.search).get('live') === '1') {
+  setTimeout(() => location.reload(), 30000);
+}
 </script>
 </body>
 </html>
 """
+    return (
+        template.replace("__TITLE__", escaped(title))
+        .replace("__SUBTITLE__", escaped(subtitle_text))
+        .replace("__UPDATED__", escaped(updated))
+        .replace("__CARDS__", cards_html)
+        .replace("__PROVIDER_OPTIONS__", provider_options)
+        .replace("__REASONING_OPTIONS__", reasoning_options)
+        .replace("__TABLE__", table)
+        .replace("__FOOTER__", footer_text)
+        .replace("__INELIGIBLE__", f"{LEADERBOARD_INELIGIBLE_FACTOR:.0%}")
+    )
 
 
 def write_leaderboard() -> Path:
@@ -3169,25 +4642,34 @@ def aggregate_agent_metrics(rounds: list[dict]) -> dict:
         "tool_other_s": 0.0,
         "self_test_s": 0.0,
         "self_test_runs": 0,
+        "self_test_failures": 0,
         "build_tool_s": 0.0,
-        "wall_ex_self_test_s": 0.0,
         "retries": 0,
+        "retry_s": 0.0,
+        "steps": 0,
         "input_tokens": 0,
         "output_tokens": 0,
         "reasoning_tokens": 0,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
+        "compaction_tokens": 0,
         "total_tokens": 0,
+        "cost_usd": 0.0,
         "max_request_tokens": 0,
         "mean_request_tokens": 0,
-        "gen_tokens_per_s": None,
         "metrics_source": "round-logs",
-        "metrics_version": 1,
+        "metrics_version": METRICS_VERSION,
     }
     for row in rounds:
         source = row.get("metrics") or {}
         for key in metrics:
-            if key in {"max_request_tokens", "mean_request_tokens", "gen_tokens_per_s", "metrics_source", "metrics_version"}:
+            if key in {
+                "steps",
+                "max_request_tokens",
+                "mean_request_tokens",
+                "metrics_source",
+                "metrics_version",
+            }:
                 continue
             value = source.get(key)
             if isinstance(value, (int, float)):
@@ -3195,6 +4677,7 @@ def aggregate_agent_metrics(rounds: list[dict]) -> dict:
         metrics["max_request_tokens"] = max(
             metrics["max_request_tokens"], int(source.get("max_request_tokens") or 0)
         )
+        metrics["steps"] += int(row.get("steps") or 0)
     if rounds:
         means = [
             float(row["metrics"].get("mean_request_tokens") or 0)
@@ -3202,9 +4685,6 @@ def aggregate_agent_metrics(rounds: list[dict]) -> dict:
             if row.get("metrics", {}).get("mean_request_tokens") is not None
         ]
         metrics["mean_request_tokens"] = sum(means) / len(means) if means else 0
-        generation = metrics["output_tokens"] + metrics["reasoning_tokens"]
-        if metrics["model_time_s"] > 0:
-            metrics["gen_tokens_per_s"] = generation / metrics["model_time_s"]
     return metrics
 
 
@@ -3598,21 +5078,11 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
     chosen_dir = Path(best["dir"])
     chosen_metrics = best.get("metrics") or {}
 
-    metrics = aggregate_agent_metrics(rounds)
+    log_metrics = aggregate_agent_metrics(rounds)
+    run_wall = sum(float(row.get("wall_s") or 0.0) for row in rounds)
+    metrics = compute_metrics(None, data_dir, run_wall, usage=log_metrics)
     metrics["compactions"] = count_compactions(data_dir)
-    metrics["self_test_runs"] = sum(int(row.get("metrics", {}).get("self_test_runs") or 0) for row in rounds)
-    metrics["max_request_tokens"] = max(
-        int(row.get("metrics", {}).get("max_request_tokens") or 0) for row in rounds
-    )
-    metrics["mean_request_tokens"] = sum(
-        float(row.get("metrics", {}).get("mean_request_tokens") or 0) for row in rounds
-    ) / len(rounds)
-    metrics["gen_tokens_per_s"] = (
-        (metrics["output_tokens"] + metrics["reasoning_tokens"]) / metrics["model_time_s"]
-        if metrics["model_time_s"] > 0
-        else None
-    )
-    metrics["metrics_source"] = "round-logs"
+    metrics["steps"] = sum(int(row.get("steps") or 0) for row in rounds)
 
     provider_errors = [row.get("provider_error") for row in rounds if row.get("provider_error")]
     agent_error = provider_errors[-1] if provider_errors else None
@@ -3705,6 +5175,8 @@ def run_one(model: str, *, rep: int, args: argparse.Namespace, variant: str | No
         "test_error": chosen_tests.get("error"),
         "result_valid": bool(final_score.get("result_valid")),
         "gate_ok": bool(final_score.get("gate_ok")),
+        "gate_pass": int(final_score.get("gate_pass") or 0),
+        "gate_total": int(final_score.get("gate_total") or 0),
         "perf_valid": bool(final_score.get("perf_valid")),
         "eligible": bool(final_score.get("eligible")),
         "integrity_violation": bool(network_integrity["integrity_violation"]),
@@ -4150,7 +5622,7 @@ def cmd_leaderboard(args: argparse.Namespace) -> int:
     print(path)
     if args.write:
         return 0
-    url = f"http://127.0.0.1:{args.port}/{path.name}"
+    url = f"http://127.0.0.1:{args.port}/"
     handler = lambda *handler_args, **kwargs: _StaticHandler(  # noqa: E731
         *handler_args, directory=str(ROOT), **kwargs
     )
@@ -4173,14 +5645,23 @@ class _StaticHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def do_GET(self):  # noqa: N802
-        name = self.path.split("?", 1)[0].lstrip("/") or "index.html"
-        path = (self.directory / name).resolve()
-        if not str(path).startswith(str(self.directory.resolve())) or not path.is_file():
-            self.send_error(404)
-            return
-        data = path.read_bytes()
+        path_only = self.path.split("?", 1)[0]
+        if path_only in ("/", "/index.html", "/leaderboard.html"):
+            try:
+                data = render_leaderboard(read_result_rows()).encode("utf-8")
+            except OSError:
+                self.send_error(500)
+                return
+        else:
+            name = path_only.lstrip("/")
+            path = (self.directory / name).resolve()
+            if not str(path).startswith(str(self.directory.resolve())) or not path.is_file():
+                self.send_error(404)
+                return
+            data = path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -4307,6 +5788,8 @@ def cmd_rescore(args: argparse.Namespace) -> int:
             "final_reps": max(1, int(getattr(args, "final_reps", 2))),
             "result_valid": score["result_valid"],
             "gate_ok": score["gate_ok"],
+            "gate_pass": int(score.get("gate_pass") or 0),
+            "gate_total": int(score.get("gate_total") or 0),
             "perf_valid": score["perf_valid"],
             "eligible": score["eligible"],
             "score": score["score"],
@@ -4325,6 +5808,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     )
     meta["test_log"] = str(rescore_dir / "test.log")
     meta["build_log"] = str(rescore_dir / "build-run.log")
+    refresh_run_metrics(meta, run_dir)
     meta.update(collect_image_metadata(args.engine, args.agent_image, args.test_image))
     for row in meta.get("rounds") or []:
         if row.get("round") == meta.get("best_round"):
@@ -4376,40 +5860,59 @@ def cmd_backfill(args: argparse.Namespace) -> int:
         if not logs:
             legacy = run_dir / "agent.log"
             logs = [legacy] if legacy.exists() else []
-        if not logs:
-            continue
         total_wall = _float(row.get("wall_s")) or 0.0
-        per_log = total_wall / len(logs) if total_wall else 0.0
-        merged: dict[str, float] = {}
-        max_request = 0
-        for log in logs:
-            metrics = read_agent_usage(log, per_log)
-            max_request = max(max_request, int(metrics.get("max_request_tokens") or 0))
-            for key, value in metrics.items():
-                if isinstance(value, (int, float)) and key not in {
-                    "max_request_tokens",
-                    "mean_request_tokens",
-                    "gen_tokens_per_s",
-                    "metrics_version",
-                }:
-                    merged[key] = merged.get(key, 0.0) + float(value)
-        merged["max_request_tokens"] = max_request
-        if logs:
-            means = [
-                float((read_agent_usage(log, per_log)).get("mean_request_tokens") or 0)
-                for log in logs
-            ]
-            merged["mean_request_tokens"] = sum(means) / len(means)
-        if merged.get("model_time_s"):
-            merged["gen_tokens_per_s"] = (
-                merged.get("output_tokens", 0.0) + merged.get("reasoning_tokens", 0.0)
-            ) / merged["model_time_s"]
-        for key, value in merged.items():
-            if key in CSV_FIELDS and row.get(key) in (None, ""):
+        per_log = total_wall / len(logs) if logs and total_wall else 0.0
+        usage = combine_attempt_metrics(
+            [{"log_path": str(log), "wall_s": per_log} for log in logs]
+        )
+        metrics = compute_metrics(
+            None, run_dir / "opencode-data", total_wall, usage=usage
+        )
+        metrics["compactions"] = count_compactions(run_dir / "opencode-data")
+        score_path = run_dir / "score.json"
+        if score_path.exists():
+            try:
+                score = json.loads(score_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                score = {}
+            for key in ("gate_pass", "gate_total"):
+                if score.get(key) not in (None, ""):
+                    metrics[key] = score[key]
+            if metrics.get("gate_pass") in (None, ""):
+                rounds = score.get("rounds") or []
+                best = next(
+                    (
+                        row
+                        for row in rounds
+                        if row.get("round") == score.get("best_round")
+                    ),
+                    None,
+                )
+                candidates = [best] if best else rounds
+                for candidate in candidates:
+                    if candidate and candidate.get("gate_total") not in (None, ""):
+                        metrics["gate_pass"] = candidate.get("gate_pass")
+                        metrics["gate_total"] = candidate.get("gate_total")
+                        break
+        updatable = set(EFFORT_FIELDS) | {
+            "steps",
+            "compactions",
+            "gate_pass",
+            "gate_total",
+        }
+        for key, value in metrics.items():
+            if key not in updatable or key not in CSV_FIELDS or value is None:
+                continue
+            current = row.get(key)
+            if current in (None, "") or str(current) != str(value):
                 row[key] = value
                 changed += 1
     if changed:
         write_result_rows(rows)
+    try:
+        write_leaderboard()
+    except Exception as exc:  # noqa: BLE001
+        eprint(f"warning: could not update leaderboard: {exc}")
     print(f"backfilled {changed} fields across {len(rows)} runs")
     return 0
 
@@ -4494,6 +5997,8 @@ def submission_from_score(meta: dict) -> dict:
         "eligible": eligible and not bool(meta.get("integrity_violation")),
         "integrity_violation": bool(meta.get("integrity_violation")),
         "gate_ok": bool(meta.get("gate_ok")),
+        "gate_pass": meta.get("gate_pass"),
+        "gate_total": meta.get("gate_total"),
         "perf_valid": bool(meta.get("perf_valid")),
         "decode_speedup": meta.get("decode_speedup"),
         "encode_speedup": meta.get("encode_speedup"),
@@ -4506,10 +6011,10 @@ def submission_from_score(meta: dict) -> dict:
         "gates": meta.get("gates"),
         "wall_s": meta.get("wall_s"),
         "model_time_s": meta.get("model_time_s"),
-        "input_tokens": meta.get("input_tokens"),
-        "output_tokens": meta.get("output_tokens"),
-        "reasoning_tokens": meta.get("reasoning_tokens"),
-        "total_tokens": meta.get("total_tokens"),
+        "steps": meta.get("steps"),
+        "files_changed": meta.get("files_changed"),
+        "compactions": meta.get("compactions"),
+        **{key: meta.get(key) for key in EFFORT_FIELDS},
         "watchdog": meta.get("watchdog"),
         "outcome": meta.get("outcome"),
         "verified": False,
@@ -4552,6 +6057,67 @@ def validate_submission(data: object) -> list[str]:
         else:
             if value <= 0:
                 problems.append(f"{key} must be positive")
+    for key in (
+        "ttft_s",
+        "think_s",
+        "output_s",
+        "tool_s",
+        "other_s",
+        "self_test_s",
+        "build_tool_s",
+        "wall_ex_self_test_s",
+        "retries",
+        "retry_s",
+        "step_median_s",
+        "step_p90_s",
+        "step_max_s",
+        "compactions",
+        "compaction_tokens",
+        "cost_usd",
+        "tokens_per_step",
+        "gen_tokens_per_s",
+        "gen_tokens_per_s_median",
+        "max_request_tokens",
+        "mean_request_tokens",
+    ):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            problems.append(f"{key} must be numeric when present")
+        else:
+            if number < 0:
+                problems.append(f"{key} must be non-negative")
+    for key in (
+        "ttft_share",
+        "think_share",
+        "output_share",
+        "tool_share",
+        "other_share",
+        "self_test_share",
+        "cache_hit_rate",
+    ):
+        value = data.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            problems.append(f"{key} must be numeric when present")
+        else:
+            if not 0 <= number <= 1:
+                problems.append(f"{key} must be between 0 and 1")
+    if data.get("gate_pass") is not None and data.get("gate_total") is not None:
+        try:
+            gate_pass = int(data["gate_pass"])
+            gate_total = int(data["gate_total"])
+        except (TypeError, ValueError):
+            problems.append("gate_pass and gate_total must be integers")
+        else:
+            if gate_pass < 0 or gate_total < 0 or gate_pass > gate_total:
+                problems.append("gate_pass must be between 0 and gate_total")
     return problems
 
 
@@ -4591,6 +6157,8 @@ def cmd_submit(args: argparse.Namespace) -> int:
     ):
         eprint("error: refusing to submit an ineligible or agent-error run")
         return 2
+    if refresh_run_metrics(meta, run_dir):
+        print("  refreshed effort metrics from the saved run artifacts")
     submission = submission_from_score(meta)
     problems = validate_submission(submission)
     if problems:
@@ -4665,13 +6233,18 @@ def cmd_site(args: argparse.Namespace) -> int:
         row = {
             "run_id": data.get("run_id"),
             "model": data.get("model"),
+            "provider": data.get("provider"),
             "variant": data.get("variant"),
+            "thinking": data.get("thinking"),
+            "reasoning_effort": data.get("reasoning_effort"),
             "score": data.get("score"),
             "decode_speedup": data.get("decode_speedup"),
             "encode_speedup": data.get("encode_speedup"),
             "eligible": data.get("eligible"),
             "integrity_violation": data.get("integrity_violation"),
             "gate_ok": data.get("gate_ok"),
+            "gate_pass": data.get("gate_pass"),
+            "gate_total": data.get("gate_total"),
             "perf_valid": data.get("perf_valid"),
             "network_policy": data.get("network_policy"),
             "cpu_set": data.get("cpu_set"),
@@ -4680,10 +6253,24 @@ def cmd_site(args: argparse.Namespace) -> int:
             "hardware": data.get("hardware"),
             "wall_s": data.get("wall_s"),
             "total_tokens": data.get("total_tokens"),
+            "compactions": data.get("compactions"),
             "timestamp": data.get("timestamp"),
             "_issue": issue.get("number"),
             "_issue_url": issue.get("url"),
         }
+        # Optional effort fields are additive on the v1 schema: older
+        # submissions simply render dashes for the detail columns.
+        for key in EFFORT_FIELDS:
+            if key in data:
+                row[key] = data.get(key)
+        if data.get("steps") is not None:
+            row["steps"] = data.get("steps")
+        if data.get("files_changed") is not None:
+            row["files_changed"] = data.get("files_changed")
+        author = issue.get("author") or {}
+        if isinstance(author, dict) and author.get("login"):
+            row["submitter"] = author.get("login")
+        row["evidence_level"] = "verified" if VERIFIED_LABEL in labels else "self-reported"
         if VERIFIED_LABEL in labels:
             row["verified"] = True
         rows.append(row)
@@ -4700,10 +6287,18 @@ def cmd_site(args: argparse.Namespace) -> int:
             chosen[key] = row
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    (output / "index.html").write_text(
-        render_leaderboard(list(chosen.values())),
-        encoding="utf-8",
+    page = render_leaderboard(
+        list(chosen.values()),
+        public=True,
+        subtitle="Community submissions · self-reported unless verified",
     )
+    (output / "index.html").write_text(page, encoding="utf-8")
+    data_dir = output / "data"
+    data_dir.mkdir(exist_ok=True)
+    (data_dir / "results.json").write_text(
+        json.dumps(list(chosen.values()), indent=2) + "\n", encoding="utf-8"
+    )
+    (output / ".nojekyll").write_text("", encoding="utf-8")
     if args.errors:
         Path(args.errors).write_text(
             json.dumps(errors, indent=2) + "\n", encoding="utf-8"

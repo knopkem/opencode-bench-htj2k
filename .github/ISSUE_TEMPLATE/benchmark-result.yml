@@ -9,7 +9,11 @@ body:
         Use `./bench.py submit --run RUN_ID --print` and paste the JSON block.
         Results are self-reported unless a maintainer adds `verified`.
         The block includes the CPU set, network policy, round count, confidence
-        and the agent/evaluator image references.
+        and the agent/evaluator image references. It also carries informational
+        effort and token fields (TTFT, thinking, output, tools, self-test,
+        request tokens, steps, compactions) that power the leaderboard detail
+        columns without affecting the score. Older blocks without those fields
+        remain valid.
         One run is accepted but is labelled `single-run`; three runs are recommended.
   - type: input
     id: model

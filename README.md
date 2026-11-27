@@ -33,6 +33,7 @@ containers.
 ./bench.py status
 ./bench.py report
 ./bench.py leaderboard           # serve + open the local page
+./bench.py backfill              # rebuild effort metrics from run artifacts
 ./bench.py rescore --run RUN_ID
 ./bench.py submit --run RUN_ID --print
 python3 -m unittest discover -s tests
@@ -213,6 +214,15 @@ the same session and workdir for up to `--provider-retries` extra attempts
 (default 2) with backoff, but only while the round budget lasts.
 
 ## Community leaderboard
+
+The local page shows one row per run with the score bar, decode/encode speedups,
+gate counts, status, wall time, the effort split, token rates and compactions.
+Effort is read from the saved `opencode-data/opencode.db` timings (TTFT,
+thinking, output, tools, self-test) and is informational only: it never changes
+the score or eligibility. Hover the effort cell for the breakdown or click it for
+step distribution, cache hit rate and cost. Provider and reasoning filters plus
+sortable columns are persisted in the browser. `./bench.py backfill` rebuilds the
+effort fields for runs recorded before the database was read.
 
 Results are submitted as issues with the `benchmark-result` label: either paste
 the block printed by `./bench.py submit --run RUN_ID --print` into the

@@ -92,7 +92,21 @@ backoff. Retry logs are written as `agent-round-N-retryK.log`.
 ## The leaderboard shows a single run
 
 One run is accepted but labelled `single-run`. Run three times with different
-seeds for a multi-run median; the page groups rows by model and variant.
+seeds for a multi-run median; the page groups rows by model, variant and
+reasoning effort.
+
+## The leaderboard effort column shows a dash
+
+The effort split (TTFT, thinking, output, tools, self-test) is read from
+`runs/<id>/opencode-data/opencode.db`. A run that kept no session database, or
+was recorded before the harness read it, falls back to log token totals and
+shows dashes for the time split; the score is unaffected. Rebuild older rows
+from their saved artifacts with:
+
+```bash
+./bench.py backfill
+./bench.py leaderboard --write
+```
 
 ## `p0.dicom-201` fails
 

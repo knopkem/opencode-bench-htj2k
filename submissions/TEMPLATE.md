@@ -23,6 +23,14 @@ the page does not mix incompatible results. The block also records the
 `agent_image` / `test_image` references and the evaluator suite version used,
 so runs scored against different images stay distinguishable.
 
+The block additionally carries informational effort fields (`ttft_s`,
+`think_s`, `output_s`, `tool_s`, `self_test_s`, their shares, request-token
+peak/mean, `gen_tokens_per_s`, `steps`, `compactions`, `cost_usd` and
+`metrics_source`). They power the leaderboard detail columns and tooltips and
+never affect the score or eligibility. Older blocks without them remain valid
+and simply render dashes. `./bench.py backfill` rebuilds the fields from the
+saved `agent-round-*.log` and `opencode-data/opencode.db` artifacts.
+
 ## Ranking
 
 Primary: score (higher is better). The score is seed-normalised and already

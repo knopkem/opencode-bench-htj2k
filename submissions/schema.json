@@ -223,6 +223,293 @@
         "number",
         "null"
       ]
+    },
+    "gate_pass": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "gate_total": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "steps": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "files_changed": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "compactions": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "span_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "agent_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "ttft_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "think_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "output_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tool_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "other_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tool_shell_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tool_write_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tool_read_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tool_other_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "self_test_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "self_test_runs": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "self_test_failures": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "build_tool_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "wall_ex_self_test_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "self_test_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "retries": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "retry_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "step_median_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "step_p90_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "step_max_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cache_read_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "cache_write_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "compaction_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "max_request_tokens": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "mean_request_tokens": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cost_usd": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cost_known": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "think_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "output_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "tool_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "ttft_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "other_share": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "gen_tokens_per_s": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "gen_tokens_per_s_median": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "tokens_per_step": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "cache_hit_rate": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "maximum": 1
+    },
+    "metrics_source": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "metrics_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
     }
   },
   "additionalProperties": true

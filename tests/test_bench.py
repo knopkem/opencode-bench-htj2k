@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -260,6 +261,45 @@ class SubmissionTests(unittest.TestCase):
     def test_bad_submission(self) -> None:
         problems = bench.validate_submission({"schema": "nope"})
         self.assertTrue(problems)
+
+    def test_effort_fields_are_optional_and_checked(self) -> None:
+        meta = {
+            "run_id": "r1",
+            "model": "provider/model",
+            "provider": "provider",
+            "suite_version": bench.SUITE_VERSION,
+            "score": 42.0,
+            "eligible": True,
+            "decode_speedup": 1.1,
+            "encode_speedup": 1.2,
+            "target_decode": 1.25,
+            "target_encode": 1.25,
+            "gates": [],
+            "ttft_s": 10.0,
+            "think_s": 20.0,
+            "output_s": 5.0,
+            "think_share": 0.4,
+            "gen_tokens_per_s": 12.5,
+            "steps": 7,
+            "compactions": 1,
+            "metrics_source": "db+log",
+            "metrics_version": bench.METRICS_VERSION,
+        }
+        submission = bench.submission_from_score(meta)
+        self.assertEqual(bench.validate_submission(submission), [])
+        self.assertEqual(submission["think_share"], 0.4)
+        broken = dict(submission, think_share=1.5)
+        self.assertTrue(
+            any("think_share" in error for error in bench.validate_submission(broken))
+        )
+        broken = dict(submission, ttft_s=-1)
+        self.assertTrue(
+            any("ttft_s" in error for error in bench.validate_submission(broken))
+        )
+        broken = dict(submission, gate_pass=5, gate_total=3)
+        self.assertTrue(
+            any("gate_pass" in error for error in bench.validate_submission(broken))
+        )
 
 
 class AgentNetworkTests(unittest.TestCase):
@@ -625,6 +665,237 @@ class LeaderboardTests(unittest.TestCase):
         self.assertAlmostEqual(entries[0]["_score"], 15.0)
         self.assertAlmostEqual(entries[1]["_score"], 10.0)
 
+    def test_effort_and_detail_columns(self) -> None:
+        row = {
+            "run_id": "detail-run",
+            "timestamp": "20261113T193949Z",
+            "model": "provider/model",
+            "provider": "provider",
+            "variant": "high",
+            "thinking": "on",
+            "reasoning_effort": "high",
+            "score": "50",
+            "eligible": "true",
+            "decode_speedup": "1.2",
+            "encode_speedup": "1.1",
+            "gate_ok": "true",
+            "gate_pass": "32",
+            "gate_total": "32",
+            "wall_s": "100",
+            "model_time_s": "60",
+            "ttft_s": "10",
+            "think_s": "30",
+            "output_s": "20",
+            "tool_s": "15",
+            "other_s": "25",
+            "think_share": "0.3",
+            "self_test_s": "5",
+            "self_test_runs": "2",
+            "max_request_tokens": "123456",
+            "gen_tokens_per_s": "20",
+            "gen_tokens_per_s_median": "21",
+            "reasoning_tokens": "1000",
+            "steps": "40",
+            "compactions": "1",
+            "retries": "1",
+            "cpu_set": "0",
+            "network_policy": "open",
+        }
+        page = bench.render_leaderboard([row])
+        self.assertEqual(page.count("<script>"), 1)
+        for needle in (
+            "Fastest model time",
+            "Median tok/s",
+            "Median think",
+            "filter-provider",
+            "filter-reasoning",
+            "detail-btn",
+            "Model medians",
+            "32/32",
+            "x1.200",
+            "x1.100",
+            "123.5k",
+        ):
+            self.assertIn(needle, page)
+        self.assertIn('data-think="30.000000"', page)
+        self.assertIn('data-tool="15.000000"', page)
+        self.assertIn("TTFT", page)
+
+    def test_public_rendering_uses_issue_metadata(self) -> None:
+        row = {
+            "run_id": "public-run",
+            "model": "provider/model",
+            "score": "10",
+            "eligible": "true",
+            "decode_speedup": "1.1",
+            "encode_speedup": "1.1",
+            "_issue": 7,
+            "_issue_url": "https://example.invalid/issues/7",
+            "submitter": "octocat",
+            "evidence_level": "verified",
+            "verified": True,
+        }
+        page = bench.render_leaderboard([row], public=True)
+        self.assertIn("maintainer-checked", page)
+        self.assertIn("octocat", page)
+        self.assertIn("#7", page)
+        self.assertIn("Submission template", page)
+
+
+class MetricsTests(unittest.TestCase):
+    def _write_session_db(self, root: Path) -> Path:
+        data_dir = root / "opencode-data"
+        data_dir.mkdir()
+        database = data_dir / "opencode.db"
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "create table session_message "
+                "(type text, seq integer, time_created integer, data text)"
+            )
+            connection.execute(
+                "insert into session_message values (?, ?, ?, ?)",
+                ("user", 1, 500, json.dumps({"time": {"created": 500}})),
+            )
+            assistant = {
+                "time": {"created": 1000, "streamed": 3000, "completed": 4000},
+                "tokens": {
+                    "input": 100,
+                    "output": 50,
+                    "reasoning": 20,
+                    "cache": {"read": 10, "write": 5},
+                },
+                "cost": 0.01,
+                "content": [
+                    {"type": "reasoning", "time": {"created": 1200, "completed": 2000}},
+                    {
+                        "type": "tool",
+                        "name": "shell",
+                        "time": {"created": 2100, "ran": 2100, "completed": 2300},
+                        "state": {
+                            "input": {"command": "cargo test"},
+                            "content": [{"type": "text", "text": "ok"}],
+                            "metadata": {"exit": 0},
+                        },
+                    },
+                    {
+                        "type": "tool",
+                        "name": "shell",
+                        "time": {"created": 2400, "ran": 2400, "completed": 2600},
+                        "state": {
+                            "input": {"command": "cargo build"},
+                            "content": [{"type": "text", "text": "ok"}],
+                            "metadata": {"exit": 0},
+                        },
+                    },
+                ],
+            }
+            connection.execute(
+                "insert into session_message values (?, ?, ?, ?)",
+                ("assistant", 2, 1000, json.dumps(assistant)),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        return data_dir
+
+    def test_read_session_metrics_splits_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = self._write_session_db(Path(directory))
+            metrics = bench.read_session_metrics(data_dir, 10.0)
+        self.assertTrue(metrics["available"])
+        self.assertAlmostEqual(metrics["span_s"], 3.5)
+        self.assertAlmostEqual(metrics["ttft_s"], 0.2)
+        self.assertAlmostEqual(metrics["think_s"], 0.9)
+        self.assertAlmostEqual(metrics["output_s"], 0.9)
+        self.assertAlmostEqual(metrics["tool_s"], 0.4)
+        self.assertAlmostEqual(metrics["self_test_s"], 0.2)
+        self.assertEqual(metrics["self_test_runs"], 1)
+        self.assertAlmostEqual(metrics["build_tool_s"], 0.2)
+        self.assertEqual(metrics["assistant_steps"], 1)
+        self.assertEqual(metrics["max_request_tokens"], 115)
+
+    def test_compute_metrics_prefers_database(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            data_dir = self._write_session_db(Path(directory))
+            metrics = bench.compute_metrics(None, data_dir, 10.0)
+        self.assertEqual(metrics["metrics_source"], "db")
+        self.assertAlmostEqual(metrics["ttft_s"], 0.2)
+        self.assertAlmostEqual(metrics["think_s"], 0.9)
+        self.assertAlmostEqual(metrics["output_s"], 0.9)
+        self.assertAlmostEqual(metrics["tool_s"], 0.4)
+        self.assertAlmostEqual(metrics["model_time_s"], 2.0)
+        self.assertAlmostEqual(metrics["other_s"], 7.6)
+        self.assertAlmostEqual(metrics["think_share"], 0.09)
+        self.assertAlmostEqual(metrics["gen_tokens_per_s"], 70.0 / 1.8)
+        self.assertAlmostEqual(metrics["wall_ex_self_test_s"], 9.8)
+        self.assertAlmostEqual(metrics["step_median_s"], 3.0)
+        self.assertEqual(metrics["tokens_per_step"], 170.0)
+        self.assertAlmostEqual(metrics["cache_hit_rate"], 10.0 / 110.0)
+        self.assertEqual(metrics["total_tokens"], 185)
+
+    def test_compute_metrics_falls_back_to_log(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "agent.log"
+            log.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "step_start",
+                                "timestamp": 1000,
+                                "part": {"messageID": "m1"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "step_finish",
+                                "timestamp": 3000,
+                                "part": {
+                                    "messageID": "m1",
+                                    "tokens": {
+                                        "input": 100,
+                                        "output": 40,
+                                        "reasoning": 10,
+                                        "cache": {"read": 0, "write": 0},
+                                    },
+                                    "cost": 0,
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n"
+            )
+            metrics = bench.compute_metrics(log, root / "missing", 10.0)
+        self.assertEqual(metrics["metrics_source"], "log")
+        self.assertIsNone(metrics["ttft_s"])
+        self.assertIsNone(metrics["think_share"])
+        self.assertAlmostEqual(metrics["model_time_s"], 2.0)
+        self.assertAlmostEqual(metrics["gen_tokens_per_s"], 25.0)
+        self.assertEqual(metrics["steps"], 1)
+
+    def test_refresh_run_metrics_derives_gates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            self._write_session_db(run_dir)
+            meta = {
+                "wall_s": 10.0,
+                "steps": 3,
+                "best_round": 1,
+                "rounds": [{"round": 1, "gate_pass": 30, "gate_total": 32}],
+                "agent_logs": [],
+            }
+            changed = bench.refresh_run_metrics(meta, run_dir)
+        self.assertTrue(changed)
+        self.assertEqual(meta["metrics_source"], "db")
+        self.assertAlmostEqual(meta["think_s"], 0.9)
+        self.assertEqual(meta["steps"], 1)
+        self.assertEqual(meta["gate_pass"], 30)
+        self.assertEqual(meta["gate_total"], 32)
+        self.assertNotIn("score", meta)
+
 
 class MeasurementTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -867,7 +1138,12 @@ class SiteTests(unittest.TestCase):
             page = (out / "index.html").read_text()
             self.assertIn("opencode-bench-htj2k leaderboard", page)
             self.assertIn("deepseek-flash", page)
+            self.assertIn("Submission template", page)
             self.assertEqual(json.loads(errors_path.read_text()), [])
+            self.assertTrue((out / ".nojekyll").is_file())
+            results = json.loads((out / "data" / "results.json").read_text())
+            self.assertEqual(len(results), 4)
+            self.assertTrue(any(item.get("_issue") for item in results))
 
     def test_site_rejects_invalid_issues(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
