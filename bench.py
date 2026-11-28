@@ -875,23 +875,37 @@ def prepare_agent_config(config_dir: Path, run_dir: Path) -> Path:
 
 def load_config_info(config_dir: Path | None = None) -> dict:
     """Return effective OpenCode config without printing its secret values."""
-    try:
-        proc = subprocess.run(
-            [OPENCODE, "debug", "config", "--standalone"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=config_env(config_dir),
-            check=False,
-        )
-        sources = json.loads(proc.stdout)
+    env = config_env(config_dir)
+    # `--standalone` is not accepted by every opencode CLI (older 1.x builds print
+    # usage and exit 1), and this call feeds a fail-closed allowlist decision, so
+    # try the flag and fall back to the plain subcommand before giving up.
+    for argv in (
+        [OPENCODE, "debug", "config", "--standalone"],
+        [OPENCODE, "debug", "config"],
+    ):
+        try:
+            proc = subprocess.run(
+                argv,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=env,
+                check=False,
+            )
+            sources = json.loads(proc.stdout)
+        except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
+            continue
+        # opencode >= 2 prints a list of sources each carrying an "info" object;
+        # older builds print one flat config object instead.
+        if isinstance(sources, dict):
+            return sources
         info: dict = {}
         for source in sources:
             if isinstance(source, dict) and isinstance(source.get("info"), dict):
                 info.update(source["info"])
-        return info
-    except (json.JSONDecodeError, OSError, subprocess.TimeoutExpired):
-        return {}
+        if info:
+            return info
+    return {}
 
 
 def load_model_entry(model: str, config_dir: Path | None = None) -> dict | None:
