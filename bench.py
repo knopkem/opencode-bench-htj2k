@@ -1921,6 +1921,35 @@ def read_session_metrics(data_dir: Path, wall_s: float) -> dict:
         connection.close()
 
 
+def ensure_session_db_readable(data_dir: Path | None) -> None:
+    """Let the harness read the session DB that the agent container wrote.
+
+    The agent container runs as root, so `opencode.db` lands as 0600 root and
+    becomes unreadable to the harness: every DB-derived metric (ttft/think/
+    output/tool split, retries, self-test time, honest generation rate) then
+    silently degrades to the log fallback. Relax the mode in place, reusing the
+    image we already have, and stay silent when docker is unavailable.
+    """
+    if data_dir is None:
+        return
+    database = data_dir / "opencode.db"
+    if not database.exists() or os.access(database, os.R_OK):
+        return
+    image = os.environ.get("OPENCODE_BENCH_AGENT_IMAGE") or DEFAULT_AGENT_IMAGE
+    try:
+        subprocess.run(
+            [
+                "docker", "run", "--rm", "--user", "0", "--entrypoint", "chmod",
+                "-v", f"{data_dir.resolve()}:/d", image, "-R", "a+rX", "/d",
+            ],
+            capture_output=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def compute_metrics(
     log_path: Path | None,
     data_dir: Path | None,
@@ -1935,6 +1964,7 @@ def compute_metrics(
     """
     if usage is None:
         usage = read_agent_usage(log_path or Path("/nonexistent"), wall_s)
+    ensure_session_db_readable(data_dir)
     session = (
         read_session_metrics(data_dir, wall_s)
         if data_dir is not None
@@ -2139,6 +2169,12 @@ def compute_metrics(
     metrics["cache_hit_rate"] = (
         cache_read_tokens / cache_total if cache_total else None
     )
+    median_rate = metrics.get("gen_tokens_per_s_median")
+    if isinstance(median_rate, (int, float)) and median_rate > 150:
+        # opencode 2.x can flush step_start and step_finish within milliseconds of
+        # each other, so that span is a logging artifact and the implied rate is
+        # inflated several-fold. The DB-derived aggregate rate carries the number.
+        metrics["gen_tokens_per_s_median"] = None
     return metrics
 
 
